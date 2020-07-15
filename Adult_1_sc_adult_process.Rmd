@@ -1,0 +1,3113 @@
+---
+title: "Adult scRNAseq datasets analysis"
+subtitle: "GL60(01+04) + run_3"
+author: "Renaud Mevel"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, cache.lazy = TRUE)
+```
+
+## Objective
+
+Analysis of 3 single cell RNAseq datasets generated on the 10x platform, including:  
+* pre-processing of the 3 individual runs  
+* assignment of cells to MULTIseq tag oligos used during sample multiplexing  
+* integration of the 3 runs into a single object  
+* dimension reduction, clustering  
+  
+    
+Raw sequencing files and processed gene expression matrices have been deposited in the NCBI Gene Expression Omnibus under the accession number GSE15194.  
+    
+  
+Directories need to be adapted throughout the scripts.
+    
+## Prepare the environment
+
+```{r , warning=FALSE, message=FALSE}
+# Data wrangling
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(data.table)
+
+# Plots
+library(gridExtra)
+library(ggpubr)
+
+# sc
+library(Seurat)
+library(sctransform)
+library(MAST)
+library(org.Mm.eg.db)
+library(DoubletFinder)
+library(ggbeeswarm)
+
+# GO
+library(gprofiler2)
+
+# Palettes
+library(pals)
+pal25 <- as.character(pals::cols25(n=25))
+kel <- as.character(pals::kelly(n=22)[3:22])
+pal.trt <- c("#a1e186", "#b9006e")
+pal.rfp <- c("#ea4749", "#479bea")
+pal.runs <- c("#ec0016", "#ffc554", "#20a4ff")
+pal.lobe = c("#272873", "#45A5A7", "#cb5155")
+pal.pop <- 
+  c( 
+    "#7a0177", "#dd3497",    # cas AP
+    "#f768a1", "#fa9fb5",    # cas DLP
+    "#fc9272", "#cb181d",    # cas
+    "#CC6677", "#AA4466",    # cas VP
+    "#081d58", "#225ea8",    # hn AP
+    "#7fcdbb", "#7fb8cd",    # hn DLP
+    "#67a9cf", "#b2d3e7"     # hn VP
+    )
+
+pal.pop2 <- 
+  c( 
+    "#7a0177", "#dd3497",    # cas AP
+    "#f768a1", "#fa9fb5",    # cas DLP
+    "#CC6677", "#AA4466",    # cas VP
+    "#8294B7", "#3F5C91",    # hn AP
+    "#75BBB4", "#468C84",    # hn DLP
+    "#77C7E6", "#3A92C7"     # hn VP
+    )
+
+pal.cl <- c(
+  "#B2B8E0", #LumA
+  "#4A6FE3", #LumB
+  "#1037AA", #LumC
+  "#D33F6A", #LumD
+  "#EF9708", #LumE
+  "#F0B98D", #LumF
+  "#8DD593"  #Basal
+  )
+
+# Directories
+setwd(dir = "~/set-directory/")
+pdf.dir <- "~/set-directory/"
+fig.dir <- "~/set-directory/"
+
+# Functions
+source("Adult_functions.R")
+
+# Seed
+set.seed(1)
+```
+
+## Run 1: run_1
+
+### Load 10x
+
+```{r}
+# This contains the  output of cell ranger count
+cr <- Read10X(data.dir = file.path("raw_data/run_1/filtered_feature_bc_matrix/")) # NOVASEQ RUN
+sc <- CreateSeuratObject(counts = cr, project = "run_1", assay = "RNA")
+```
+
+### Load multiseq
+
+```{r}
+bar.table01 <- readRDS(file = file.path("raw_data/run_1/multiseq_count_matrix/bar.table.rds"))
+```
+
+Transform and plot data
+```{r}
+# transform
+tbar <- t(bar.table01)
+tbar <- tbar[1:8, ]
+
+htos01 <- as.data.frame(tbar)
+
+# make long format and plot log read counts
+df.long01 <- as.data.frame(tbar) %>% 
+  tibble::rownames_to_column(var = "tag") %>% 
+  tidyr::gather(cell_barcode, value, -tag) %>% 
+  dplyr::mutate(Log = log10(value+1))
+
+ggplot(df.long01, aes(x=cell_barcode)) + 
+  geom_point(aes(y=Log, colour = factor(tag)), alpha = 0.5) + 
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x=element_blank()) +
+  facet_grid(~tag) +
+  scale_colour_brewer(palette = "Paired") +
+  ggtitle("Run 1: MULTIseq read count") +  
+  ylab("Log10 of tag read count") +
+  xlab("Unique cell Barcodes") +
+  labs(color='tags')
+```
+
+Add hto data
+```{r}
+# rename
+colnames(htos01) <- paste0(colnames(htos01), "-1", sep = "")
+
+# Add HTO data as a new assay independent from RNA
+sc[["HTO"]] <- CreateAssayObject(counts = htos01)
+
+# Number of cells
+cat("Number of cells:", length(colnames(sc)))
+```
+
+### Filter
+
+Filter-out low quality cells. Keep cells which have more than 750 genes, less than 7500 UMIs, and less than 10% mitochondrial transcripts.
+```{r}
+sc[["percent.mt"]] <- PercentageFeatureSet(sc, pattern = "^mt-")
+plot1 <- VlnPlot(sc, features = c("percent.mt"))
+plot2 <- VlnPlot(sc, features = c("percent.mt"), y.max = 10)
+plot1+plot2
+
+VlnPlot(sc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1+plot2
+
+sc <- subset(sc, subset = nFeature_RNA > 750 & nFeature_RNA < 7500 & percent.mt < 10)
+VlnPlot(sc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1+plot2
+
+cat("Number of cells:", length(colnames(sc)))
+```
+
+### Demultiplex cells
+
+Normalize HTO data, here we use centered log-ratio (CLR) transformation. Then use `HTODemux` to find thresholds.
+```{r}
+DefaultAssay(object = sc) <- "HTO"
+sc <- NormalizeData(sc, assay = "HTO", normalization.method = "CLR")
+
+# 0.99
+sc <- HTODemux(sc, assay = "HTO", positive.quantile = 0.99, kfunc = "kmeans")
+
+# Print numbers of cells per classification
+table(sc$HTO_classification.global)
+table(sc$hash.ID)
+```
+
+Show barcodes in UMAP space. Some cells appear to be wrongly classified. We will deal with them later by applying a stricter threshold determined empirically to remove cells with low barcode counts.
+```{r}
+sc <- RunUMAP(sc, assay = "HTO", features = rownames(sc@assays$HTO))
+DimPlot(sc, reduction = "umap", cols = pal25, pt.size = 1)
+ggsave(filename = file.path(fig.dir, "0_individual_runs/Run1_UMAP_tags_unfiltered.png"), device = "png", width = 6, height = 4, dpi = 300)
+```
+
+Note: the labelling of Barcode 3 has failed, meant to label DLP_HN_RFP+ cells. This population will be included later from the 3rd run ('run_3').
+  
+  
+Add the multiseq tag data to sc object
+```{r}
+# add metadata under tag name
+sc <- AddMetaData(object = sc, metadata = sc$hash.ID, col.name = "tag")
+```
+
+### Metadata
+
+Add population/sample name to the tag information
+```{r}
+#read in metadata
+meta <- read.delim(file.path("metadata/metadata_run1.txt"), "\t", header = T, stringsAsFactors = F)
+meta <- dplyr::filter(meta, run_id == "run_1")
+meta <- dplyr::rename(meta, final.ids = bar_id)
+
+#extract cell ids/htos
+df.tags <- as.data.frame(sc$tag)
+
+#make the datafrane
+df.pop <- tibble::rownames_to_column(.data = df.tags)
+df.pop <- dplyr::rename(df.pop, final.ids = `sc$tag`)
+df.pop <- left_join(df.pop, meta, "final.ids")
+
+df.sa <- dplyr::select(df.pop, rowname, population)
+table(df.sa$population)
+
+df.trt <- dplyr::select(df.pop, rowname, treatment)
+table(df.trt$treatment)
+
+df.lobe <- dplyr::select(df.pop, rowname, lobe)
+table(df.lobe$lobe)
+
+df.rfp <- dplyr::select(df.pop, rowname, RFP)
+table(df.rfp$RFP)
+
+#make right vector to add metadata
+df.sa <- tibble::column_to_rownames(.data = df.sa, var = "rowname")
+df.trt <- tibble::column_to_rownames(.data = df.trt, var = "rowname")
+df.lobe <- tibble::column_to_rownames(.data = df.lobe, var = "rowname")
+df.rfp <- tibble::column_to_rownames(.data = df.rfp, var = "rowname")
+
+#add metadata
+sc <- AddMetaData(object = sc, metadata = df.sa, col.name = "population")
+sc <- AddMetaData(object = sc, metadata = df.trt, col.name = "treatment")
+sc <- AddMetaData(object = sc, metadata = df.lobe, col.name = "lobe")
+sc <- AddMetaData(object = sc, metadata = df.rfp, col.name = "rfp")
+```
+
+### Manual filtering
+
+UMAP of singlets in barcode space reveals some likely wrong clustering.
+```{r}
+tmp <- sc
+DefaultAssay(tmp) <- "HTO"
+Idents(tmp) <- "HTO_classification.global"
+tmp <- subset(tmp, idents = "Singlet")
+Idents(tmp) <- "hash.ID"
+table(tmp$HTO_classification.global)
+table(tmp$hash.ID)
+tmp <- RunUMAP(tmp, assay = "HTO", features = rownames(tmp@assays$HTO))
+DimPlot(tmp, reduction = "umap", cols = pal25, pt.size = 1)
+rm(tmp)
+```
+
+*Cut-offs found by HTODemux:*  
+* Cutoff for Bar1 : 32 reads  
+* Cutoff for Bar2 : 122 reads  
+* Cutoff for Bar3 : 0 reads  
+* Cutoff for Bar4 : 46 reads  
+* Cutoff for Bar5 : 19 reads  
+* Cutoff for Bar6 : 22 reads  
+* Cutoff for Bar7 : 6 reads  
+* Cutoff for Bar8 : 5 reads  
+  
+  
+*Manual cut-offs:*  
+* Bar1: 35  
+* Bar2: 125  
+* Bar3: exclude  
+* Bar4: 50  
+* Bar5: 30  
+* Bar6: 30  
+* Bar7: 25  
+* Bar8: 25  
+  
+  
+Apply empirical thresholds:
+```{r}
+DefaultAssay(sc) <- "HTO"
+
+Bar1 <- subset(sc, idents = "Bar1", subset = Bar1>35, slot = "counts")
+Bar2 <- subset(sc, idents = "Bar2", subset = Bar2>125, slot = "counts")
+Bar4 <- subset(sc, idents = "Bar4", subset = Bar4>50, slot = "counts") #
+Bar5 <- subset(sc, idents = "Bar5", subset = Bar5>30, slot = "counts")
+Bar6 <- subset(sc, idents = "Bar6", subset = Bar6>30, slot = "counts") #
+Bar7 <- subset(sc, idents = "Bar7", subset = Bar7>25, slot = "counts") #
+Bar8 <- subset(sc, idents = "Bar8", subset = Bar8>25, slot = "counts") #
+
+sc <- merge(Bar1, y = c(Bar2,Bar4,Bar5,Bar6,Bar7,Bar8))
+
+# Number of cells per classification
+table(sc$HTO_classification.global)
+table(sc$hash.ID)
+
+# UMAP in barode space
+sc <- RunUMAP(sc, assay = "HTO", features = rownames(sc@assays$HTO))
+DimPlot(sc, reduction = "umap", cols = pal25)
+
+cat("Number of cells:", length(colnames(sc)))
+```
+
+### DoubletFinder
+
+The use of Multiseq barcodes enables the identification of most doublets. However, because the labelling did not work well for one population (Barcode 3), we are likely missing certain barcodes. To further clean the dataset of additional doublets, we apply the [DoubletFinder](https://github.com/chris-mcginnis-ucsf/DoubletFinder) package.
+```{r}
+## Pre-process  -------------------------------------------------------------------------------------------------------------
+sc.d1 <- sc
+DefaultAssay(sc.d1) <- "RNA"
+sc.d1 <- NormalizeData(sc.d1, normalization.method = "LogNormalize", scale.factor = 1e4)
+sc.d1 <- FindVariableFeatures(sc.d1, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+sc.d1 <- ScaleData(sc.d1, verbose = FALSE)
+sc.d1 <- RunPCA(sc.d1, npcs = 50, verbose = T)
+sc.d1 <- RunUMAP(sc.d1, reduction = "pca", dims = 1:50, seed.use = 1)
+sc.d1 <- FindNeighbors(sc.d1, reduction = "pca", dims = 1:50, k.param = 20L)
+sc.d1 <- FindClusters(sc.d1, resolution = 0.8)
+DimPlot(sc.d1, cols = pal25) 
+
+## pK Identification (no ground-truth) ---------------------------------------------------------------------------------------
+sweep.res.list_sc.d1 <- paramSweep_v3(sc.d1, PCs = 1:50, sct = FALSE)
+sweep.stats_sc.d1 <- summarizeSweep(sweep.res.list_sc.d1, GT = FALSE)
+bcmvn_sc.d1 <- find.pK(sweep.stats_sc.d1)
+
+## Plot results of pK Identification
+pK=as.numeric(as.character(bcmvn_sc.d1$pK))
+BCmetric=bcmvn_sc.d1$BCmetric
+pK_choose = pK[which(BCmetric %in% max(BCmetric))]
+
+par(mar=c(5,4,4,8)+1,cex.main=1.2,font.main=2)
+plot(x = pK, y = BCmetric, pch = 16,type="b", col = "blue",lty=1)
+abline(v=pK_choose,lwd=2,col='red',lty=2)
+title("The BCmvn distributions")
+text(pK_choose,max(BCmetric),as.character(pK_choose),pos = 4,col = "red")
+
+## Homotypic Doublet Proportion Estimate -------------------------------------------------------------------------------------
+annotations <- sc.d1@meta.data$tag
+homotypic.prop <- modelHomotypic(annotations)           
+nExp_poi <- round(0.05*length(colnames(sc.d1)))  ## Assuming 5% doublet 
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+## Run DoubletFinder with varying classification stringencies ----------------------------------------------------------------
+sc.d1 <- doubletFinder_v3(sc.d1, PCs = 1:50, pN = 0.25, pK = 0.02, nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = FALSE)
+table(sc.d1$DF.classifications_0.25_0.02_25)
+DimPlot(sc.d1, group.by = "DF.classifications_0.25_0.02_25", cols = pal25)
+
+## Extract cell ids of Singlets ----------------------------------------------------------------------------------------------
+Idents(sc.d1) <- "DF.classifications_0.25_0.02_25"
+sc.d1 <- subset(sc.d1, idents = "Singlet")
+singlets <- names(sc.d1$DF.classifications_0.25_0.02_25)
+```
+
+### Singlets
+
+```{r}
+# keep singlets only based on DoubletFinder
+# (or not singlets <- names(sc$HTO_classification.global)) // delete
+sc <- subset(sc, cells = singlets)
+cat("Number of cells:", length(colnames(sc)))
+
+# make a copy at this stage for future use if needed
+sc01_save <- sc
+
+sc01 <- sc
+DefaultAssay(sc01) <- "RNA"
+Idents(sc01) <- "population"
+
+# umap on tags after removing negatives and doublets
+sc.umap01<- RunUMAP(sc01, assay = "HTO", features = rownames(sc01@assays$HTO))
+DimPlot(sc.umap01, group.by = "tag", cols = pal25, pt.size = 1) 
+#ggsave(filename = file.path(pdf.dir, "run_1_UMAP_tags_filtered.pdf"), width = 10, height = 6)
+ggsave(filename = file.path(fig.dir, "0_individual_runs/Run1_UMAP_tags_filtered.png"), device = "png", width = 6, height = 4, dpi = 300)
+```
+
+Remove unwanted objects
+```{r}
+rm(sc,Bar1,Bar2,Bar4,Bar5,Bar6,Bar7,Bar8)
+rm(singlets,sc.d1,sweep.res.list_sc.d1,sweep.stats_sc.d1,bcmvn_sc.d1,pK,BCmetric,pK_choose,annotations,homotypic.prop,nExp_poi,nExp_poi.adj)
+```
+
+## Run 2: run_2
+
+### Load 10x
+
+```{r}
+# This contains the  output of cell ranger count
+cr <- Read10X(data.dir = file.path("raw_data/run_2/filtered_feature_bc_matrix/")) # NOVASEQ RUN
+sc <- CreateSeuratObject(counts = cr, project = "run_2", assay = "RNA")
+```
+
+### Load multiseq
+
+```{r}
+bar.table04 <- readRDS(file = file.path("raw_data/run_2/multiseq_count_matrix/bar.table.rds"))
+```
+
+Transform and plot data
+```{r}
+# transform
+tbar <- t(bar.table04)
+tbar <- tbar[1:12, ]
+
+htos04 <- as.data.frame(tbar)
+  
+# make long format and plot log read counts
+df.long04 <- as.data.frame(tbar) %>% 
+  tibble::rownames_to_column(var = "tag") %>% 
+  tidyr::gather(cell_barcode, value, -tag) %>% 
+  dplyr::mutate(Log = log10(value+1))
+
+ggplot(df.long04, aes(x=cell_barcode)) + 
+  geom_point(aes(y=Log, colour = factor(tag)), alpha = 0.5) + 
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x=element_blank()) +
+  facet_grid(~tag) +
+  scale_colour_brewer(palette = "Paired") +
+  ggtitle("Run 2: MULTIseq read count") +
+  ylab("Log10 of tag read count") +
+  xlab("Unique cell Barcodes") +
+  labs(color='tags')
+```
+
+Add hto data
+```{r}
+# rename
+colnames(htos04) <- paste0(colnames(htos04), "-1", sep = "")
+
+# Add HTO data as a new assay independent from RNA
+sc[["HTO"]] <- CreateAssayObject(counts = htos04)
+
+# Number of cells
+cat("Number of cells:", length(colnames(sc)))
+```
+
+### Filter
+
+Filter-out low quality cells. Keep cells which have more than 750 genes, less than 7500 UMIs, and less than 10% mitochondrial transcripts.
+```{r}
+sc[["percent.mt"]] <- PercentageFeatureSet(sc, pattern = "^mt-")
+plot1 <- VlnPlot(sc, features = c("percent.mt"))
+plot2 <- VlnPlot(sc, features = c("percent.mt"), y.max = 10)
+plot1+plot2
+
+VlnPlot(sc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1+plot2
+
+sc <- subset(sc, subset = nFeature_RNA > 750 & nFeature_RNA < 7500 & percent.mt < 10)
+VlnPlot(sc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1+plot2
+
+# Number of cells
+cat("Number of cells:", length(colnames(sc)))
+```
+
+### Demultiplex cells
+
+Normalize HTO data, here we use centered log-ratio (CLR) transformation. Then use `HTODemux` to find thresholds.
+```{r}
+DefaultAssay(object = sc) <- "HTO"
+sc <- NormalizeData(sc, assay = "HTO", normalization.method = "CLR")
+
+# 0.99
+sc <- HTODemux(sc, assay = "HTO", positive.quantile = 0.99, kfunc = "kmeans")
+
+# Print numbers of cells per classification
+table(sc$HTO_classification.global)
+table(sc$hash.ID)
+```
+
+Show barcodes in UMAP space. Some cells appear to be wrongly classified. We will deal with them later by applying a stricter threshold determined empirically to remove cells with low barcode counts.
+```{r}
+sc <- RunUMAP(sc, assay = "HTO", features = rownames(sc@assays$HTO))
+DimPlot(sc, reduction = "umap", cols = pal25, pt.size = 1)
+ggsave(filename = file.path(fig.dir, "0_individual_runs/Run2_UMAP_tags_unfiltered.png"), device = "png", width = 6, height = 4, dpi = 300)
+```
+
+Note: the labelling of Barcode 3 has failed here too, meant to label DLP_HN_RFP+ cells. This population will be included later from the 3rd run ('run_3').
+  
+  
+Add the multiseq tag data to sc object
+```{r}
+# add metadata under tag name
+sc <- AddMetaData(object = sc, metadata = sc$hash.ID, col.name = "tag")
+```
+
+### Metadata
+
+Add population/sample name to the tag information
+```{r}
+#read in metadata
+meta <- read.delim(file.path("metadata/metadata_run2.txt"), "\t", header = T, stringsAsFactors = F)
+meta <- dplyr::filter(meta, run_id == "run_2")
+meta <- dplyr::rename(meta, final.ids = bar_id)
+
+#extract cell ids/htos
+df.tags <- as.data.frame(sc$tag)
+
+#make the datafrane
+df.pop <- tibble::rownames_to_column(.data = df.tags)
+df.pop <- dplyr::rename(df.pop, final.ids = `sc$tag`)
+df.pop <- left_join(df.pop, meta, "final.ids")
+
+df.sa <- dplyr::select(df.pop, rowname, population)
+table(df.sa$population)
+
+df.trt <- dplyr::select(df.pop, rowname, treatment)
+table(df.trt$treatment)
+
+df.lobe <- dplyr::select(df.pop, rowname, lobe)
+table(df.lobe$lobe)
+
+df.rfp <- dplyr::select(df.pop, rowname, RFP)
+table(df.rfp$RFP)
+
+#make right vector to add metadata
+df.sa <- tibble::column_to_rownames(.data = df.sa, var = "rowname")
+df.trt <- tibble::column_to_rownames(.data = df.trt, var = "rowname")
+df.lobe <- tibble::column_to_rownames(.data = df.lobe, var = "rowname")
+df.rfp <- tibble::column_to_rownames(.data = df.rfp, var = "rowname")
+
+#add metadata
+sc <- AddMetaData(object = sc, metadata = df.sa, col.name = "population")
+sc <- AddMetaData(object = sc, metadata = df.trt, col.name = "treatment")
+sc <- AddMetaData(object = sc, metadata = df.lobe, col.name = "lobe")
+sc <- AddMetaData(object = sc, metadata = df.rfp, col.name = "rfp")
+```
+
+### Manual filtering
+
+UMAP of singlets in barcode space reveals some likely wrong clustering.
+```{r}
+tmp <- sc
+DefaultAssay(tmp) <- "HTO"
+Idents(tmp) <- "HTO_classification.global"
+tmp <- subset(tmp, idents = "Singlet")
+Idents(tmp) <- "hash.ID"
+table(tmp$HTO_classification.global)
+table(tmp$hash.ID)
+tmp <- RunUMAP(tmp, assay = "HTO", features = rownames(tmp@assays$HTO))
+DimPlot(tmp, reduction = "umap", cols = pal25, pt.size = 1)
+rm(tmp)
+```
+
+*Cut-offs found by HTODemux:*  // UPDATE VALUES
+Cutoff for Bar1 : 33 reads  
+Cutoff for Bar2 : 70 reads  
+Cutoff for Bar3 : 1 reads  
+Cutoff for Bar4 : 75 reads  
+Cutoff for Bar5 : 93 reads  
+Cutoff for Bar6 : 148 reads  
+Cutoff for Bar7 : 30 reads  
+Cutoff for Bar8 : 17 reads  
+Cutoff for Bar9 : 24 reads  
+Cutoff for Bar10 : 12 reads  
+Cutoff for Bar11 : 19 reads  
+Cutoff for Bar12 : 17 reads  
+  
+  
+*Manual cut-offs:*  
+* Bar1: 35  
+* Bar2: 75  
+* Bar3: exclude  
+* Bar4: 80  
+* Bar5: 100  
+* Bar6: 150  
+* Bar7: 35  
+* Bar8: 25  
+* Bar9: 25  
+* Bar10: 20  
+* Bar11: 25  
+* Bar12: 25  
+  
+  
+Apply empirical thresholds:
+```{r}
+DefaultAssay(sc) <- "HTO"
+
+Bar1 <- subset(sc, idents = "Bar1", subset = Bar1>35, slot = "counts")
+Bar2 <- subset(sc, idents = "Bar2", subset = Bar2>75, slot = "counts")
+Bar4 <- subset(sc, idents = "Bar4", subset = Bar4>80, slot = "counts")
+Bar5 <- subset(sc, idents = "Bar5", subset = Bar5>100, slot = "counts")
+Bar6 <- subset(sc, idents = "Bar6", subset = Bar6>150, slot = "counts")
+Bar7 <- subset(sc, idents = "Bar7", subset = Bar7>35, slot = "counts")
+Bar8 <- subset(sc, idents = "Bar8", subset = Bar8>25, slot = "counts")
+Bar9 <- subset(sc, idents = "Bar9", subset = Bar9>25, slot = "counts")
+Bar10 <- subset(sc, idents = "Bar10", subset = Bar10>20, slot = "counts")
+Bar11 <- subset(sc, idents = "Bar11", subset = Bar11>25, slot = "counts")
+Bar12 <- subset(sc, idents = "Bar12", subset = Bar12>25, slot = "counts")
+
+sc <- merge(Bar1, y = c(Bar2,Bar4,Bar5,Bar6,Bar7,Bar8,Bar9,Bar10,Bar11,Bar12))
+
+# Number of cells per classification
+table(sc$HTO_classification.global)
+table(sc$hash.ID)
+
+# UMAP in barode space
+sc <- RunUMAP(sc, assay = "HTO", features = rownames(sc@assays$HTO))
+DimPlot(sc, reduction = "umap", cols = pal25)
+
+# Number of cells
+cat("Number of cells:", length(colnames(sc)))s
+```
+
+### DoubletFinder
+
+The use of Multiseq barcodes enables the identification of most doublets. However, because the labelling did not work well for one population (Barcode 3), we are likely missing certain barcodes. To further clean the dataset of additional doublets, we apply the [DoubletFinder](https://github.com/chris-mcginnis-ucsf/DoubletFinder) package.
+```{r}
+## Pre-process  -------------------------------------------------------------------------------------------------------------
+sc.d4 <- sc
+DefaultAssay(sc.d4) <- "RNA"
+sc.d4 <- NormalizeData(sc.d4, normalization.method = "LogNormalize", scale.factor = 1e4)
+sc.d4 <- FindVariableFeatures(sc.d4, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+sc.d4 <- ScaleData(sc.d4, verbose = FALSE)
+sc.d4 <- RunPCA(sc.d4, npcs = 50, verbose = T)
+sc.d4 <- RunUMAP(sc.d4, reduction = "pca", dims = 1:50, seed.use = 1)
+sc.d4 <- FindNeighbors(sc.d4, reduction = "pca", dims = 1:50, k.param = 20L)
+sc.d4 <- FindClusters(sc.d4, resolution = 0.8)
+DimPlot(sc.d4, cols = pal25) 
+
+## pK Identification (no ground-truth) ---------------------------------------------------------------------------------------
+sweep.res.list_sc.d4 <- paramSweep_v3(sc.d4, PCs = 1:50, sct = FALSE)
+sweep.stats_sc.d4 <- summarizeSweep(sweep.res.list_sc.d4, GT = FALSE)
+bcmvn_sc.d4 <- find.pK(sweep.stats_sc.d4)
+
+## Plot results of pK Identification
+pK=as.numeric(as.character(bcmvn_sc.d4$pK))
+BCmetric=bcmvn_sc.d4$BCmetric
+pK_choose = pK[which(BCmetric %in% max(BCmetric))]
+
+par(mar=c(5,4,4,8)+1,cex.main=1.2,font.main=2)
+plot(x = pK, y = BCmetric, pch = 16,type="b", col = "blue",lty=1)
+abline(v=pK_choose,lwd=2,col='red',lty=2)
+title("The BCmvn distributions")
+text(pK_choose,max(BCmetric),as.character(pK_choose),pos = 4,col = "red")
+
+## Homotypic Doublet Proportion Estimate -------------------------------------------------------------------------------------
+annotations <- sc.d4@meta.data$tag
+homotypic.prop <- modelHomotypic(annotations)           
+nExp_poi <- round(0.05*length(colnames(sc.d4)))  ## Assuming 5% doublet 
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+
+## Run DoubletFinder with varying classification stringencies ----------------------------------------------------------------
+## Use pK of 0.01 as it corresponds to the second maxima after 0.25, which is too high and performs poorly. 
+## 0.01 accurately identifies a small talk of cells clustering with basal cells and expressing high levels of Pbsn.
+sc.d4 <- doubletFinder_v3(sc.d4, PCs = 1:50, pN = 0.25, pK = 0.01, nExp = nExp_poi.adj, reuse.pANN = FALSE, sct = FALSE)
+table(sc.d4$DF.classifications_0.25_0.01_95)
+DimPlot(sc.d4, group.by = "DF.classifications_0.25_0.01_95", cols = pal25)
+
+## Extract cell ids of Singlets ----------------------------------------------------------------------------------------------
+Idents(sc.d4) <- "DF.classifications_0.25_0.01_95"
+sc.d4 <- subset(sc.d4, idents = "Singlet")
+singlets <- names(sc.d4$DF.classifications_0.25_0.01_95)
+```
+
+### Singlets
+
+```{r}
+# keep singlets only based on DoubletFinder
+# (or not singlets <- names(sc$HTO_classification.global)) // delete
+sc <- subset(sc, cells = singlets)
+
+# Number of cells
+cat("Number of cells:", length(colnames(sc)))
+
+# make a copy at this stage for future use if needed
+sc04_save <- sc
+
+sc04 <- sc
+DefaultAssay(sc04) <- "RNA"
+Idents(sc04) <- "population"
+
+# umap on tags after removing negatives and doublets
+sc.umap04<- RunUMAP(sc04, assay = "HTO", features = rownames(sc04@assays$HTO))
+DimPlot(sc.umap04, group.by = "tag", cols = pal25, pt.size = 1) 
+#ggsave(filename = file.path(pdf.dir, "run_2_UMAP_tags_filtered.pdf"), width = 10, height = 6)
+ggsave(filename = file.path(fig.dir, "0_individual_runs/Run2_UMAP_tags_filtered.png"), device = "png", width = 6, height = 4, dpi = 300)
+```
+
+Remove unwanted objects
+```{r}
+rm(sc,cr,Bar1,Bar2,Bar4,Bar5,Bar6,Bar7,Bar8,Bar9,Bar10,Bar11,Bar12,tbar)
+rm(plot1,plot2)
+rm(singlets,sc.d4,sweep.res.list_sc.d4,sweep.stats_sc.d4,bcmvn_sc.d4,pK,BCmetric,pK_choose,annotations,homotypic.prop,nExp_poi,nExp_poi.adj)
+```
+
+## Run 3: run_3
+
+### Load 10x
+
+```{r}
+# This contains the  output of cell ranger count
+cr <- Read10X(data.dir = file.path("raw_data/run_3/filtered_feature_bc_matrix/")) # HISEQ RUN
+sc <- CreateSeuratObject(counts = cr, project = "run_3", assay = "RNA")
+```
+
+### Load multiseq
+
+```{r}
+bar.table64 <- readRDS(file = file.path("raw_data/run_3/multiseq_count_matrix/bar.table.rds"))
+```
+
+Transform and plot data
+```{r}
+# transform
+tbar <- t(bar.table64)
+tbar <- tbar[1:6, ]
+
+htos64 <- as.data.frame(tbar)
+
+# make long format and plot log read counts
+df.long64 <- as.data.frame(tbar) %>% 
+  tibble::rownames_to_column(var = "tag") %>% 
+  tidyr::gather(cell_barcode, value, -tag) %>% 
+  dplyr::mutate(Log = log10(value+1))
+
+ggplot(df.long64, aes(x=cell_barcode)) + 
+  geom_point(aes(y=Log, colour = factor(tag)), alpha = 0.5) + 
+  theme(panel.grid.minor = element_blank(),
+        axis.text.x=element_blank()) +  # turn off minor grid
+  facet_grid(~tag) +
+  scale_colour_brewer(palette = "Paired") +
+  ggtitle("Run 3: MULTIseq read count") +
+  ylab("Log10 of tag read count") +
+  xlab("Unique cell Barcodes") +
+  labs(color='tags')
+```
+
+Add hto data
+```{r}
+# rename
+colnames(htos64) <- paste0(colnames(htos64), "-1", sep = "")
+
+# Add HTO data as a new assay independent from RNA
+sc[["HTO"]] <- CreateAssayObject(counts = htos64)
+
+# Number of cells
+cat("Number of cells:", length(colnames(sc)))
+```
+
+### Filter
+
+Filter-out low quality cells
+```{r}
+sc[["percent.mt"]] <- PercentageFeatureSet(sc, pattern = "^mt-")
+plot1 <- VlnPlot(sc, features = c("percent.mt"))
+plot2 <- VlnPlot(sc, features = c("percent.mt"), y.max = 10)
+plot1+plot2
+
+VlnPlot(sc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1+plot2
+
+sc <- subset(sc, subset = nFeature_RNA > 750 & nFeature_RNA < 7500 & percent.mt < 10)
+VlnPlot(sc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(sc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1+plot2
+
+# Number of cells
+cat("Number of cells:", length(colnames(sc)))
+```
+
+### Demultiplex cells
+
+Normalize HTO data, here we use centered log-ratio (CLR) transformation
+```{r}
+DefaultAssay(object = sc) <- "HTO"
+sc <- NormalizeData(sc, assay = "HTO", normalization.method = "CLR")
+
+# 0.99
+sc <- HTODemux(sc, assay = "HTO", positive.quantile = 0.99, kfunc = "kmeans")
+
+# Print numbers of cells per classification
+table(sc$HTO_classification.global)
+table(sc$hash.ID)
+```
+
+Show barcodes in UMAP space. Few cells appear to be wrongly classified. We will deal with them later by applying a stricter threshold determined empirically to remove cells with low barcode counts.
+```{r}
+sc <- RunUMAP(sc, assay = "HTO", features = rownames(sc@assays$HTO))
+DimPlot(sc, reduction = "umap", cols = pal25, pt.size = 1)
+ggsave(filename = file.path(fig.dir, "0_individual_runs/Run3_UMAP_tags_unfiltered.png"), device = "png", width = 6, height = 4, dpi = 300)
+```
+
+Add tag data to sc object
+```{r}
+# add metadata under tag name
+sc <- AddMetaData(object = sc, metadata = sc$hash.ID, col.name = "tag")
+```
+
+### Metadata
+
+Add population/sample name to the tag information
+```{r}
+#read in metadata
+meta <- read.delim(file.path("metadata/metadata_run3.txt"), "\t", header = T, stringsAsFactors = F)
+meta <- dplyr::filter(meta, run_id == "run_3")
+meta <- dplyr::rename(meta, final.ids = bar_id)
+
+#extract cell ids/htos
+df.tags <- as.data.frame(sc$tag)
+
+#make the datafrane
+df.pop <- tibble::rownames_to_column(.data = df.tags)
+df.pop <- dplyr::rename(df.pop, final.ids = `sc$tag`)
+df.pop <- left_join(df.pop, meta, "final.ids")
+
+df.sa <- dplyr::select(df.pop, rowname, population)
+table(df.sa$population)
+
+df.trt <- dplyr::select(df.pop, rowname, treatment)
+table(df.trt$treatment)
+
+df.lobe <- dplyr::select(df.pop, rowname, lobe)
+table(df.lobe$lobe)
+
+df.rfp <- dplyr::select(df.pop, rowname, RFP)
+table(df.rfp$RFP)
+
+#make right vector to add metadata
+df.sa <- tibble::column_to_rownames(.data = df.sa, var = "rowname")
+df.trt <- tibble::column_to_rownames(.data = df.trt, var = "rowname")
+df.lobe <- tibble::column_to_rownames(.data = df.lobe, var = "rowname")
+df.rfp <- tibble::column_to_rownames(.data = df.rfp, var = "rowname")
+
+#add metadata
+sc <- AddMetaData(object = sc, metadata = df.sa, col.name = "population")
+sc <- AddMetaData(object = sc, metadata = df.trt, col.name = "treatment")
+sc <- AddMetaData(object = sc, metadata = df.lobe, col.name = "lobe")
+sc <- AddMetaData(object = sc, metadata = df.rfp, col.name = "rfp")
+```
+
+### Manual filtering
+
+UMAP of singlets in barcode space shows good separation between conditions, so we don't add an extra manual filtering step.
+```{r}
+tmp <- sc
+DefaultAssay(tmp) <- "HTO"
+Idents(tmp) <- "HTO_classification.global"
+tmp <- subset(tmp, idents = "Singlet")
+Idents(tmp) <- "hash.ID"
+table(tmp$HTO_classification.global)
+table(tmp$hash.ID)
+tmp <- RunUMAP(tmp, assay = "HTO", features = rownames(tmp@assays$HTO))
+DimPlot(tmp, reduction = "umap", cols = pal25, pt.size = 1)
+rm(tmp)
+```
+
+### Singlets
+
+```{r}
+# keep singlets only based on DoubletFinder
+Idents(sc) <- "HTO_classification.global"
+sc <- subset(sc, idents = "Singlet")
+
+# Number of cells
+cat("Number of cells:", length(colnames(sc)))
+
+# make a copy at this stage for future use if needed
+sc64_save <- sc
+
+sc64 <- sc
+DefaultAssay(sc64) <- "RNA"
+Idents(sc64) <- "population"
+
+# umap on tags after removing negatives and doublets
+sc.umap64<- RunUMAP(sc64, assay = "HTO", features = rownames(sc64@assays$HTO))
+DimPlot(sc.umap64, group.by = "tag", cols = pal25, pt.size = 1) 
+#ggsave(filename = file.path(pdf.dir, "run_3_UMAP_tags_filtered.pdf"), width = 10, height = 6)
+ggsave(filename = file.path(fig.dir, "0_individual_runs/Run3_UMAP_tags_filtered.png"), device = "png", width = 6, height = 4, dpi = 300)
+```
+
+Remove unwanted objects
+```{r}
+rm(sc)
+```
+
+
+## A. Seurat Integration
+
+joseph_export
+```{r}
+joseph_export <- list(sc01, sc04, sc64)
+saveRDS(joseph_export, file = file.path("r_save/non_integrated_export.rds"))
+```
+
+
+Prepare objects for integration. Normalise each object and find variable features:
+```{r}
+# run 1
+sc.n1 <- sc01
+DefaultAssay(sc.n1) <- "RNA"
+sc.n1 <- NormalizeData(sc.n1, normalization.method = "LogNormalize", scale.factor = 1e4)
+sc.n1 <- FindVariableFeatures(sc.n1, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+
+# run 2
+sc.n4 <- sc04
+DefaultAssay(sc.n4) <- "RNA"
+sc.n4 <- NormalizeData(sc.n4, normalization.method = "LogNormalize", scale.factor = 1e4)
+sc.n4 <- FindVariableFeatures(sc.n4, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+
+# run 3
+sc.n64 <- sc64
+DefaultAssay(sc.n64) <- "RNA"
+sc.n64 <- NormalizeData(sc.n64, normalization.method = "LogNormalize", scale.factor = 1e4)
+sc.n64 <- FindVariableFeatures(sc.n64, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+```
+
+### Integrate
+
+Perform integration:
+```{r}
+prostate.list <- list(sc.n1, sc.n4, sc.n64)
+
+# Find anchors
+prostate.anchors <- FindIntegrationAnchors(object.list = prostate.list, dims = 1:50, anchor.features = 2000)
+
+# Integrate
+prostate.integrated <- IntegrateData(anchorset = prostate.anchors, dims = 1:50)
+
+# copy to new object
+sci <- prostate.integrated
+
+# remove unwanted variables
+rm(prostate.anchors,prostate.list)
+
+# number of variable features in the integrated dataset
+length(sci[["integrated"]]@var.features)
+```
+
+### Filter
+
+Run 1 contains few castrated cells, which we kept until this point to perform the integration of the 3 datasets. However, these cells were sorted from the whole castrated prostate and we are not able to assign them to a specific lobe. For clarity and consistency, we remove these x cells from the analysis.
+```{r}
+Idents(sci) <- "lobe"
+sci <- subset(sci, idents = c("AP", "DLP", "VP"))
+Idents(sci) <- "population"
+```
+
+Change ident levels
+```{r}
+sci$lobe <- factor(x = sci$lobe, levels = c("AP", "DLP", "VP"))
+```
+
+### Scale RNA
+
+Normalise/Scale RNA for later downstream use.
+```{r}
+DefaultAssay(sci) <- "RNA"
+
+sci <- NormalizeData(sci, normalization.method = "LogNormalize", scale.factor = 1e4, assay = "RNA")
+sci <- FindVariableFeatures(sci, selection.method = "vst", nfeatures = 3000, verbose = FALSE, assay = "RNA")
+sci <- ScaleData(sci, verbose = T, assay = "RNA", features = rownames(sci))
+```
+
+## B. All cells
+
+### UMAP/PCA
+
+**Dim. red.**  
+Note: might have to optimise, especially regarding the Ly6d/Upk3a cluster...  
+```{r}
+DefaultAssay(sci) <- "integrated"
+
+sci <- ScaleData(sci, verbose = FALSE)
+sci <- RunPCA(sci, npcs = 50, verbose = T)
+sci <- RunUMAP(sci, reduction = "pca", dims = 1:50, seed.use = 1)
+sci <- FindNeighbors(sci, reduction = "pca", dims = 1:50, k.param = 20L)
+sci <- FindClusters(sci, resolution = 0.4)
+
+DimPlot(sci, reduction = "umap", cols = pal25, label = TRUE, pt.size = 0.5)
+```
+
+### Visualise
+
+Visualise clusters
+```{r}
+DimPlot(sci, reduction = "umap", cols = pal25, label = TRUE, pt.size = 1, label.size = 5) + ggtitle("All cells - Clusters")
+ggsave(filename = file.path(pdf.dir, "Integrated_UMAP_clus_allcells.pdf"), width = 15, height = 10)
+```
+
+Visualise integration
+```{r}
+DimPlot(sci, reduction = "umap", pt.size = 1, group.by = "orig.ident", cols = pal.runs)
+ggsave(filename = file.path(pdf.dir, "Integrated_UMAP_integration_allcells.pdf"), width = 15, height = 10)
+```
+
+Populations
+```{r}
+DimPlot(sci, group.by="population", pt.size=1, cols=pal.pop)
+```
+
+Visualise populations
+```{r}
+p1=DimPlot(sci, group.by="population", pt.size=.8, cols=pal.pop) + ggtitle("Sorted populations")
+p2=DimPlot(sci, group.by="treatment", pt.size=.8, cols=pal.trt) + ggtitle("Hormonal status")
+p3=DimPlot(sci, group.by = "lobe", pt.size=.8, cols=pal.lobe) + ggtitle("Lobes")
+p4=DimPlot(sci, group.by = "rfp", pt.size=.8, cols=pal.rfp) + ggtitle("RFP status")
+(p1+p2)/(p3+p4)
+ggsave(filename = file.path(pdf.dir, "Allcells_UMAP_meta_allcells.pdf"), width = 20, height = 15)
+```
+
+Visualise gene expression
+```{r}
+DefaultAssay(sci) <- "RNA"
+
+FeaturePlot(sci, "Msmb")
+FeaturePlot(sci, "Pecam1")
+
+FeaturePlot(sci, c("Ly6d", "Foxq1", "Upk3a", "Nupr1"))
+FeaturePlot(sci, c("Top2a", "Mcm6"))
+FeaturePlot(sci, c("Runx1", "Nkx3-1"))
+FeaturePlot(sci, c("Krt5", "Trp63"))
+FeaturePlot(sci, c("Ly6d", "Tacstd2"))
+FeaturePlot(sci, c("Pbsn", "Nkx3-1"))
+```
+
+Plot features
+```{r}
+VlnPlot(sci, group.by = "population", ncol = 1, pt.size = 0.05, cols = pal25,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"))
+
+VlnPlot(sci, group.by = "population", ncol = 1, pt.size = 0.05, cols = pal25,
+        features = c( "nCount_RNA"))
+```
+
+### Identify clusters
+
+Plot some genes
+```{r}
+DefaultAssay(sci) <- "RNA"
+FeaturePlot(sci, features = c("Epcam", "Svs4", "Upk3a", "Ly6d", "Col1a1", "Vim"))
+FeaturePlot(sci, features = c("Cd52", "Ptprc", "Itgam", "Pecam1", "Cd74", "Cd3d"))
+```
+
+Find markers
+```{r, eval=FALSE}
+all.markers <- FindAllMarkers(sci, only.pos = TRUE, 
+                              min.pct = 0.50, logfc.threshold = 0.25, 
+                              test.use = "MAST")
+
+top.all <- all.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+```
+
+Plot single gene
+```{r}
+FeaturePlot(sci, features = c("Svs4"))
+```
+  
+  
+Hemato: Ptprc, Cd52, Itgam, Cd74, Runx3  
+Fibro: Vim, Col1a1, Mgp, Acta2  
+Endo: Pecam1, Vim
+Cycling: Top2a, Mki67  
+Bladder: Upk3a, Ly6d, Ivl, S100a6  
+Seminal vesicles: Svs4, Svs5  
+  
+  
+*Dotplot*
+```{r}
+DefaultAssay(sci) <- "RNA"
+
+epi.markers.to.plot <- 
+  c(
+    "Epcam", "Krt8", "Cd24a",
+    "Sbp", "Spink1","Abo",
+    "Psca", "Krt4", "Wfdc2",
+    "Tgm4", "Nkx3-1", "Pbsn",
+    "Lmo7", "Clu", "Krt19",
+    "Ang5", "Crym", "Piezo2",
+    "Trp63", "Krt5", "Krt14",
+    
+    "Vim", "Ptprc", "Cd74", "Itgam",
+     "Cd3d", "Pecam1", "Col1a1", "Svs4"
+    )
+
+DotPlot(sci, 
+        features = rev(epi.markers.to.plot), 
+        group.by = "seurat_clusters",
+        cols = c("darkblue", "tomato"), dot.scale = 8) + RotatedAxis()
+
+ggsave(filename = file.path(pdf.dir, "Allcells_dotplot.pdf"), width = 8, height = 6, device = "pdf")
+```
+
+### PaperFigures
+
+UMAPs
+```{r}
+# Clusters
+DimPlot(sci, reduction = "umap", cols = kel, pt.size = 0.4)
+ggsave(filename = file.path(fig.dir, "1_integration/Allcells_UMAP_clusters.png"), device = "png", width = 6, height = 4, dpi = 300)
+
+# Runs
+## combined
+DimPlot(sci, reduction = "umap", pt.size = 0.4, group.by = "orig.ident", cols = pal.runs)
+ggsave(filename = file.path(fig.dir, "1_integration/Allcells_UMAP_runs.png"), device = "png", width = 6, height = 4, dpi = 300)
+## split
+DimPlot(sci, reduction = "umap", pt.size = 0.4, group.by = "orig.ident", cols = pal.runs, split.by = "orig.ident")
+ggsave(filename = file.path(fig.dir, "1_integration/Allcells_UMAP_runs_split.png"), device = "png", width = 12, height = 4, dpi = 300)
+```
+
+Dotplot
+```{r}
+# res 0.4 - relevel clusters
+sci$seurat_clusters <- factor(sci$seurat_clusters, 
+                            levels=c("6", "2", "3", "4", "14", "10", 
+                                     "0", "1", "5", "8",
+                                     "7", "15", "13", "9", "11", "12"))
+
+# Plot
+DefaultAssay(sci) <- "RNA"
+markers.to.plot <- 
+  c(
+    "Epcam", "Krt8", "Cd24a",
+    "Spink1", "Krt19",
+    "Tacstd2", "Psca", "Krt4",
+    "Tgm4", "Nkx3-1", "Pbsn", "Msmb",
+    "Piezo2",
+    "Trp63", "Krt5", "Krt14",
+    
+    "Vim", "Ptprc", "Cd74", "Itgam",
+     "Cd3d", "Pecam1", "Col1a1", "Svs2", "Pax2"
+    )
+
+DotPlot(sci, 
+        features = rev(markers.to.plot), 
+        group.by = "seurat_clusters",
+        cols = c("darkblue", "tomato"), dot.scale = 5) + RotatedAxis() + FontSize(x.text = 12, y.text = 12)
+
+ggsave(filename = file.path(fig.dir, "1_integration/Allcells_dotplot.png"), device = "png", width = 8, height = 6, dpi = 300)
+```
+
+Gene expression
+```{r}
+source("r_scripts/functions.R")
+# Extract UMAPs coordinates
+sci.UMAP <- as.data.frame(Embeddings(sci[["umap"]]))
+sci.UMAP <- sci.UMAP %>% 
+  dplyr::mutate(CellBarcode = colnames(sci),
+                Clusters = sci$seurat_clusters,
+                Population = sci$population,
+                Treatment = sci$treatment,
+                Lobe = sci$lobe,
+                RFP = sci$rfp)
+
+# Runx1
+gene <- "Runx1"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Ptprc
+gene <- "Ptprc"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Col1a1
+gene <- "Col1a1"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Pecam1
+gene <- "Pecam1"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Cd74
+gene <- "Cd74"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Svs4
+gene <- "Svs4"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Svs4
+gene <- "Svs2"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Cd3g
+gene <- "Cd3g"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Vim
+gene <- "Vim"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Retnla
+gene <- "Retnla"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Ccl4
+gene <- "Ccl4"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Cdh5
+gene <- "Cdh5"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Epcam
+gene <- "Epcam"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt8
+gene <- "Krt8"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt5
+gene <- "Krt5"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Cd24a
+gene <- "Cd24a"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Pax2
+gene <- "Pax2"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Foxi1
+gene <- "Foxi1"
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sci, sci.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("1_integration/Allcells_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+```
+
+
+### Save/Load
+
+```{r, eval=FALSE}
+save.image(file = file.path("r_save/seurat_integration.RData"))
+```
+
+```{r, eval=FALSE}
+saveRDS(sci, file = file.path("r_save/sci_integrated.rds"))
+```
+
+Load if need to start here
+```{r, eval=FALSE}
+sci <- readRDS(file.path("r_save/sci_integrated.rds"))
+```
+
+## C. Epithelial cells
+
+### Filter
+
+*Keep prostate epithelial clusters*
+```{r}
+Idents(sci) <- "seurat_clusters"
+sce <- subset(sci, idents = c(0:6,8,10,14), invert = FALSE)
+DimPlot(sce, reduction = "umap", cols = kel, label = TRUE, pt.size = 0.5)
+```
+
+### PCA/UMAP
+
+**Dim. red.**
+```{r}
+DefaultAssay(sce) <- "integrated"
+sce <- RunPCA(sce, npcs = 50, verbose = T, assay = "integrated")
+sce <- RunUMAP(sce, reduction = "pca", dims = 1:50, seed.use = 1, assay = "integrated", min.dist = 0.3)
+sce <- FindNeighbors(sce, reduction = "pca", dims = 1:50, assay = "integrated", k.param = 20L)
+sce <- FindClusters(sce, resolution = 0.3)
+
+DimPlot(sce, reduction = "umap", cols = kel, label = TRUE, pt.size = 0.5)
+```
+
+Save original seurat_clusters in a separate object
+```{r}
+seu_clus <- sce$integrated_snn_res.0.3
+#sce <- AddMetaData(object = sce, metadata = seu_clus, col.name = "orig_seu_clus")
+```
+
+
+### Clustree
+
+Use Clustree to evaluate clustering. We should 0.3 as this identifies 6 distinct luminal clusters, separated from 3 basal cell clusters. 
+```{r}
+library(clustree)
+
+scc <- FindClusters(
+  sce,
+  reduction = "pca", 
+  dims = 1:50,
+  k.param = 20L,
+  resolution = seq(0, 1, 0.1),
+  save.SNN = TRUE,
+  print.output = FALSE)
+
+clustree(scc)
+DimPlot(object = scc, reduction = "umap", label=TRUE, group.by = "integrated_snn_res.0.6")
+```
+
+### Plot data
+
+Visualise clusters
+```{r}
+DimPlot(sce, reduction = "umap", cols = pal25, label = TRUE, pt.size = 1, label.size = 5) + ggtitle("Epithelial cells - Clusters")
+ggsave(filename = file.path(pdf.dir, "PE_UMAP_clusters_unlabelled.pdf"), width = 15, height = 10)
+```
+
+Visualise integration
+```{r}
+DimPlot(sce, reduction = "umap", pt.size = 1, group.by = "orig.ident", cols = pal.runs)
+ggsave(filename = file.path(pdf.dir, "PE_UMAP_runs.pdf"), width = 15, height = 10)
+```
+
+Populations
+```{r}
+DimPlot(sce, group.by="population", pt.size=1, cols=pal.pop)
+```
+
+Visualise populations
+```{r}
+p11=DimPlot(sce, group.by="population", pt.size=.8, cols=pal.pop) + ggtitle("Sorted populations")
+p12=DimPlot(sce, group.by="treatment", pt.size=.8, cols=pal.trt) + ggtitle("Hormonal status")
+p13=DimPlot(sce, group.by = "lobe", pt.size=.8, cols=pal.lobe) + ggtitle("Lobes")
+p14=DimPlot(sce, group.by = "rfp", pt.size=.8, cols=pal.rfp) + ggtitle("RFP status")
+(p11+p12)/(p13+p14)
+ggsave(filename = file.path(pdf.dir, "PE_UMAP_meta.pdf"), width = 20, height = 15)
+```
+
+Individual plots
+```{r, eval=FALSE}
+DimPlot(sce, group.by="population", pt.size=.8, cols=pal.pop) + ggtitle("Sorted populations")
+DimPlot(sce, group.by="treatment", pt.size=.8, cols=pal.trt) + ggtitle("Hormonal status")
+DimPlot(sce, group.by = "lobe", pt.size=.8, cols=pal.lobe) + ggtitle("Lobes")
+DimPlot(sce, group.by = "rfp", pt.size=.8, cols=pal.rfp) + ggtitle("RFP status")
+```
+
+Plot Runx1 vs RFP
+```{r}
+DefaultAssay(sce) <- "RNA"
+g1 <- FeaturePlot(sce, "Runx1")
+g2 <- DimPlot(sce, group.by = "rfp", pt.size=.5, cols=pal.rfp) + ggtitle("RFP")
+g1+g2
+```
+
+Bac-a-sable: Plot single gene
+```{r}
+FeaturePlot(sce, "Tacstd2")
+```
+
+Bac-a-sable: Plot 2 genes
+```{r, eval=FALSE}
+FeaturePlot(sce, c("Runx1", "Nkx3-1"))
+```
+
+### Re-label clusters
+
+Plot clusters
+```{r}
+DimPlot(sce, reduction = "umap", cols = pal25, label = TRUE, pt.size = 0.5)
+```
+  
+New cluster IDs
+```{r}
+in_silico_clusters <- c(
+  "Bas",     #0
+  "Bas",     #1
+  "Lum-A",   #2
+  "Lum-D",   #3
+  "Lum-B",   #4
+  "Bas",     #5
+  "Lum-E",   #6
+  "Lum-F",   #7
+  "Lum-C"    #8
+  )
+
+names(in_silico_clusters) <- levels(sce$seurat_clusters)
+sce <- RenameIdents(sce, in_silico_clusters)
+
+#relevel
+relevel <- c(
+  "Lum-A",   #2
+  "Lum-B",   #4
+  "Lum-C",   #8
+  "Lum-D",   #3
+  "Lum-E",   #6
+  "Lum-F",   #7
+
+  "Bas"
+  )
+
+Idents(sce) <- factor(Idents(sce), levels = relevel)
+sce$in_silico_clusters <- Idents(sce)
+
+DimPlot(sce, reduction = "umap", cols = pal.cl, label = TRUE, repel = TRUE, pt.size = .8)
+ggsave(filename = file.path(pdf.dir, "PE_UMAP_clusters.pdf"), width = 9, height = 6, device = "pdf")
+```
+
+### Save/Load PE
+
+```{r}
+saveRDS(sce, file = file.path("r_save/sce_integrated.rds"))
+```
+
+Load if need to start here
+```{r, eval=FALSE}
+sce <- readRDS(file.path("r_save/sce_integrated.rds"))
+```
+
+### FindMarkers
+
+Load if exists already
+```{r, eval=FALSE}
+epi.markers <- readRDS(file.path("r_save/epi.markers.rds"))
+```
+
+Use **MAST** algorithm.
+```{r, eval=FALSE}
+epi.markers <- FindAllMarkers(
+  sce, 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = FALSE)
+
+saveRDS(epi.markers, file = file.path("r_save/epi.markers.rds"))
+
+# Top positive markers
+top5.epi <- 
+  epi.markers %>% 
+  group_by(cluster) %>% 
+  filter(avg_logFC>0) %>% 
+  top_n(n=5, wt=avg_logFC)
+
+top10.epi <- 
+  epi.markers %>% 
+  group_by(cluster) %>% 
+  filter(avg_logFC>0) %>% 
+  top_n(n=10, wt=avg_logFC)
+
+# write csv
+write.table(x = epi.markers, file = paste0("r_export/", "epi.markers.txt"), 
+            sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+Lum-D vs Lum-ABC
+```{r}
+D_vs_ABC <- FindMarkers(
+  sce,
+  ident.1 = c("Lum-D"),
+  ident.2 = c("Lum-A", "Lum-B", "Lum-C"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = FALSE)
+
+write.table(x = D_vs_ABC, file = paste0("r_export/", "D_vs_ABC.txt"), 
+            sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+
+### Cell cycle phases
+
+Tutorial here: https://satijalab.org/seurat/v3.0/cell_cycle_vignette.html  
+```{r}
+# Marker list from Tirosh et al, 2015. Segregate this list into markers of G2/M phase and markers of S phase.0
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+# Function to convert each gene to mouse nomenclature by changing case (checked that gene names exist in ensembl too)
+firstup <- function(x) { 
+  x <- tolower(x)
+  substr(x, 1, 1) <- toupper(substr(x, 1, 1))
+  x
+}
+
+s.genes <- firstup(s.genes)
+g2m.genes <- firstup(g2m.genes)
+```
+
+Make sure to specify the "assay" parameter 
+```{r}
+cc <- CellCycleScoring(
+  sce,
+  s.features = s.genes,
+  g2m.features = g2m.genes,
+  assay = 'RNA',
+  set.ident = TRUE
+)
+
+head(cc[[]])
+```
+
+```{r}
+#umap1 after
+pal.cc <- c("#4B6EB3", "#FFCC4C", "#FF7A7D") #cell cycle phases
+
+DimPlot(cc, reduction = "umap.sc", group.by = "Phase", cols=pal.cc, pt.size=0.8)
+umap1 <- umap1 + NoLegend() + NoAxes()
+ggsave(umap1, filename = file.path(fig.dir, "2_all_cells/Allcells_UMAP_after_ccReg_nolegend.png"), device = "png", width = 6, height = 6, dpi = 300)
+```
+
+
+Cell cycle phase
+```{r}
+DimPlot(object = sce, reduction = "umap", group.by = "Phase", label=TRUE, label.size = 5, pt.size = 1, cols=pal.cc)
+ggsave(filename = file.path(fig.dir, "3_main_cluster/Main_UMAP_cellcycle.png"), device = "png", width = 6, height = 4, dpi = 300)
+DimPlot(object = sce, reduction = "umap", group.by = "Phase", pt.size = 1, cols=pal.cc) + NoLegend() + NoAxes()
+ggsave(filename = file.path(fig.dir, "3_main_cluster/Main_UMAP_cellcycle_nolegend.png"), device = "png", width = 7, height = 5, dpi = 300)
+```
+
+Cell cycle phase per day
+```{r}
+statcc <- 
+  meta %>% 
+  group_by(sample, Phase) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+ggplot(statcc, aes(x = sample, y = perc, fill = Phase, label = count)) +
+  geom_bar(stat="identity", width = 0.5) +
+  labs(x="Time point", y="Percentage", fill="Phase",
+       title = "Proportion of cycling cells per days") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+Cell cycle phase per cluster
+```{r}
+statcc <- 
+  sce@meta.data %>% 
+  group_by(in_silico_clusters, Phase) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+  
+ggplot(statcc, aes(x = in_silico_clusters, y = perc, fill = factor(Phase, levels=c("G1", "S", "G2M")), label = count)) +
+  geom_bar(stat="identity", width = 0.8) +
+  geom_text(size = 3, position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = pal.cc) +
+  labs(x="Clusters", y="Percentage", fill="",
+       title = "Proportion of cycling cells per clusters") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+ggsave(filename = file.path(fig.dir, "3_main_cluster/Meta_ccPhase_per_cluster.png"), device = "png", width = 4, height = 3, dpi = 300)
+```
+
+## D. Loom Export
+
+Export to loom file to generate PAGA and new UMAP initiated on PAGA.
+
+All epithelial cells
+```{r}
+library(loomR)
+
+scl <- sce
+DefaultAssay(scl) <- "integrated"
+scl@project.name <- "mevel_et_al_sc_adult"
+
+# remove useless slots
+scl$nCount_HTO <- NULL
+scl$nFeature_HTO <- NULL
+scl$HTO_maxID <- NULL
+scl$HTO_secondID <- NULL
+scl$HTO_margin <- NULL
+scl$HTO_classification <- NULL
+scl$HTO_classification.global <- NULL
+scl$hash.ID <- NULL
+scl$tag <- NULL
+scl$integrated_snn_res.0.3 <- NULL
+
+# add cell id in metadata
+df.cell <- data.frame(Cell = colnames(sce))
+rownames(df.cell) <- df.cell$Cell
+scl <- AddMetaData(object = scl, metadata = df.cell, col.name = "Cell")
+
+# keep only useful assay
+seu.full <- DietSeurat(
+  scl,
+  counts = TRUE,
+  data = TRUE,
+  scale.data = TRUE,
+  features = NULL,
+  assays = "integrated",
+  dimreducs = c("umap", "pca"),
+  graphs = c("integrated_nn", "integrated_snn")
+)
+
+# as loom
+loom.scl <- as.loom(scl)
+loom.scl$close_all()
+rm(loom.scl)
+```
+
+Luminal only
+```{r}
+library(loomR)
+
+# filter
+Idents(sce) <- "in_silico_clusters"
+scl <- subset(sce, idents = c("Bas"), invert = TRUE)
+
+# make integrated default
+DefaultAssay(scl) <- "integrated"
+scl@project.name <- "mevel_et_al_sc_adult_luminal"
+
+# remove useless slots
+scl$nCount_HTO <- NULL
+scl$nFeature_HTO <- NULL
+scl$HTO_maxID <- NULL
+scl$HTO_secondID <- NULL
+scl$HTO_margin <- NULL
+scl$HTO_classification <- NULL
+scl$HTO_classification.global <- NULL
+scl$hash.ID <- NULL
+scl$tag <- NULL
+scl$integrated_snn_res.0.3 <- NULL
+
+# add cell id in metadata
+df.cell <- data.frame(Cell = colnames(sce))
+rownames(df.cell) <- df.cell$Cell
+scl <- AddMetaData(object = scl, metadata = df.cell, col.name = "Cell")
+
+# keep only useful assay
+seu.full <- DietSeurat(
+  scl,
+  counts = TRUE,
+  data = TRUE,
+  scale.data = TRUE,
+  features = NULL,
+  assays = "integrated",
+  dimreducs = c("umap", "pca"),
+  graphs = c("integrated_nn", "integrated_snn")
+)
+
+# as loom
+loom.scl <- as.loom(scl)
+loom.scl$close_all()
+rm(loom.scl)
+```
+
+## E. Metadata metrics
+
+Store metadata
+```{r}
+meta = sce@meta.data
+```
+
+#### Numbers
+  
+*Per run*
+```{r}
+stat <- 
+  meta %>% 
+  group_by(orig.ident) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+# Plot
+ggplot(stat, aes(x=orig.ident, y=count, fill=orig.ident)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  geom_text(aes(y=count,label = count, hjust=0)) +
+  labs(x="Run ID", y="Number of cells", 
+       title = "Number of cells per 10x run") +
+  scale_fill_manual(values = pal.runs) +
+  scale_y_continuous(limits=c(0, max(stat$count) + 0.05*max(stat$count))) +
+   theme(
+     legend.position = "none",
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+*Per tagged population*
+```{r}
+stat <- 
+  meta %>% 
+  group_by(population) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+# Plot
+ggplot(stat, aes(x=population, y=count, fill=population)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  scale_fill_manual(values = pal.pop) +
+  labs(x="Run ID", y="Number of cells", 
+       title = "Number of cells per population") +
+   theme(
+     legend.position = "none",
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+*Per RFP*
+```{r}
+stat <- 
+  meta %>% 
+  group_by(rfp) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+# Plot
+ggplot(stat, aes(x=rfp, y=count, fill=rfp)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  scale_fill_manual(values = pal.rfp) +
+  labs(x="Run ID", y="Number of cells", 
+       title = "Number of cells per RFP status") +
+   theme(
+     legend.position = "none",
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+*Per Treatment*
+```{r}
+stat <- 
+  meta %>% 
+  group_by(treatment) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+# Plot
+ggplot(stat, aes(x=treatment, y=count, fill=treatment)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  scale_fill_manual(values = pal.trt) +
+  labs(x="Run ID", y="Number of cells", 
+       title = "Number of cells per Hormonal Status") +
+   theme(
+     legend.position = "none",
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+*Per Lobe*
+```{r}
+stat <- 
+  meta %>% 
+  group_by(lobe) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+# Plot
+ggplot(stat, aes(x=lobe, y=count, fill=lobe)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  scale_fill_manual(values = pal.lobe) +
+  labs(x="Run ID", y="Number of cells", 
+       title = "Number of cells per lobe") +
+   theme(
+     legend.position = "none",
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+#### Proportions
+
+*Intact/Regressed Per In Silico Cluster* - Proportion are not really meaningful due to pre-sort!
+```{r}
+stat <- 
+  meta %>% 
+  group_by(in_silico_clusters, treatment) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+ggplot(stat, aes(x = in_silico_clusters, y = perc, fill = treatment, label = count)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = pal.trt) +
+  labs(x=NULL, y="Percentage", fill="Treatment",
+       title = "Proportion of intact/regressed cells per in silico cluster") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+# numbers
+ggplot(stat, aes(x = in_silico_clusters, y = count, fill = treatment)) +
+  geom_bar(stat="identity", position = "stack", width = 0.5) +
+  scale_fill_manual(values = pal.trt) +
+  labs(x=NULL, y="Cell number", fill="Treatment",
+       title = "Number of intact/regressed cells per in silico cluster") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+*RFP Hi/Lo Per In Silico Cluster* - Proportion are not really meaningful due to pre-sort!
+```{r}
+stat <- 
+  meta %>% 
+  group_by(in_silico_clusters, rfp) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+# percentage
+ggplot(stat, aes(x = in_silico_clusters, y = perc, fill = rfp, label = count)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = pal.rfp) +
+  labs(x=NULL, y="Percentage", fill="RFP",
+       title = "Proportion of RFP Hi/Lo cells per in silico cluster") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+# numbers
+ggplot(stat, aes(x = in_silico_clusters, y = count, fill = rfp)) +
+  geom_bar(stat="identity", position = "stack", width = 0.5) +
+  scale_fill_manual(values = pal.rfp) +
+  labs(x=NULL, y="Cell number", fill="RFP",
+       title = "Number of cells from each RFP sorted population") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+*Population Per In Silico Cluster* - Proportion are not really meaningful due to pre-sort!
+```{r}
+stat <- 
+  meta %>% 
+  group_by(in_silico_clusters, population) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+# percentage
+ggplot(stat, aes(x = in_silico_clusters, y = perc, fill = population, label = count)) +
+  geom_bar(stat="identity", width = 0.5) +
+  scale_fill_manual(values = pal.pop) +
+  labs(x=NULL, y="Percentage", fill="Sorted population",
+       title = "Population Per In Silico Cluster") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+# numbers
+ggplot(stat, aes(x = in_silico_clusters, y = count, fill = population)) +
+  geom_bar(stat="identity", position = "stack", width = 0.5) +
+  scale_fill_manual(values = pal.pop) +
+  labs(x=NULL, y="Cell number", fill="Sorted populations",
+       title = "Population Per In Silico Cluster") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+*Population Per In Silico Cluster* - Proportion are not really meaningful due to pre-sort!
+```{r}
+stat <- 
+  meta %>% 
+  group_by(in_silico_clusters, lobe) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+# percentage
+ggplot(stat, aes(x = in_silico_clusters, y = perc, fill = lobe, label = count)) +
+  geom_bar(stat="identity", width = 0.5) +
+  scale_fill_manual(values = pal.lobe) +
+  labs(x=NULL, y="Percentage", fill="Sorted population - lobe",
+       title = "Population Per In Silico Cluster") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+
+*Population per run* - Proportion are not really meaningful due to pre-sort!
+```{r}
+stat <- 
+  meta %>% 
+  group_by(orig.ident, population) %>% 
+  summarise(count=n()) %>% 
+  complete(population, fill = list(count = 0)) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+# percentage
+ggplot(stat, aes(x = orig.ident, y = perc, fill = population, label = count)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 3, position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = pal.pop) +
+  labs(x=NULL, y="Percentage", fill="Sorted populations",
+       title = "Proportion of cells from each sorted population per 10x run") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+# numbers
+ggplot(stat, aes(x = orig.ident, y = count, fill = population)) +
+  geom_bar(stat="identity", position = "stack", width = 0.5) +
+  scale_fill_manual(values = pal.pop) +
+  labs(x=NULL, y="Cell number", fill="Sorted populations",
+       title = "Number of cells from each sorted population per 10x run") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+# numbers / per population / facet by run
+ggplot(stat, aes(x = population, y = count, fill = population)) +
+  geom_bar(stat="identity", width = 0.6) +
+  geom_text(aes(y=count,label = count, hjust=-0.2)) +
+  scale_fill_manual(values = pal.pop) +
+  scale_y_continuous(limits=c(0, max(stat$count) + 0.1*max(stat$count))) +
+  labs(x=NULL, y="Cell number", fill="Sorted populations",
+       title = "Number of cells from each sorted population per 10x run") +
+  facet_grid(.~orig.ident) +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+# Pooled runs
+ggplot(stat, aes(x = population, y = count, fill = population)) +
+  geom_bar(stat="identity", width = 0.5) +
+  scale_fill_manual(values = pal.pop) +
+  labs(x=NULL, y="Cell number", fill="Sorted populations",
+       title = "Number of cells from each sorted population") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+### Sankey
+
+```{r}
+library(alluvial)
+
+df.allu <- meta %>% 
+  filter(in_silico_clusters != "Bas") %>% 
+  tibble::rownames_to_column( "cell_id") %>%
+  group_by(in_silico_clusters, treatment) %>%
+  dplyr::summarize(counts = n()) %>%
+  ungroup() %>%
+  dplyr::arrange(desc(counts))
+
+alluvial(
+  dplyr::select(df.allu, treatment, in_silico_clusters),
+  freq = df.allu$counts,
+  border="grey80",
+  alpha = 0.8,
+  blocks=TRUE
+)
+```
+
+```{r}
+library(ggalluvial)
+library(ggfittext)
+
+df.allu <- meta %>% 
+  #filter(in_silico_clusters != "Bas") %>% 
+  tibble::rownames_to_column( "cell_id") %>%
+  group_by(in_silico_clusters, treatment, lobe, rfp) %>%
+  dplyr::summarize(counts = n()) %>%
+  ungroup() %>%
+  dplyr::arrange(desc(counts))
+
+# Lobes / geom label
+ggplot(df.allu, aes(y = counts, axis1 = treatment, axis2 = in_silico_clusters, axis3 = rfp)) +
+  geom_alluvium(aes(fill = lobe), width = 1/6) +
+  geom_stratum(width = 0.25, fill = "white", color = "grey") +
+  geom_label(stat = "stratum", infer.label = TRUE, label.size = NA, alpha = 0, color = 'black', fontface = "bold") +
+  scale_x_discrete(limits = c("Hormonal status", "Cluster", "RFP"), expand = c(.05, .05)) +
+  scale_fill_manual(values = pal.lobe) +
+  theme(
+    axis.ticks = element_blank(),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill="white", colour = "white")
+    ) 
+
+# Treatment|Clusters|RFP / colour by lobe  -----------------------------------
+ggplot(df.allu, aes(y = counts, axis1 = treatment, axis2 = in_silico_clusters, axis3 = factor(rfp, levels = c("Low", "High")))) +
+  geom_alluvium(aes(fill = lobe), width = 1/6) +
+  scale_fill_manual(values = pal.lobe) +
+  geom_stratum(width = 0.25, fill = "white", color = "grey80", linetype = "solid") +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  scale_x_discrete(limits = c("Hormonal status", "Cluster", "RFP status"), expand = c(.05, .05)) +
+  theme(
+    axis.ticks = element_blank(),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill="white", colour = "white")
+    ) 
+
+# Treatment|Clusters|RFP / colour by cluster  -----------------------------------
+ggplot(df.allu, aes(y = counts, axis1 = treatment, axis2 = in_silico_clusters, axis3 = factor(rfp, levels = c("Low", "High")))) +
+  geom_alluvium(aes(fill = in_silico_clusters), width = 1/6) +
+  scale_fill_manual(values = pal.cl) +
+  geom_stratum(width = 0.25, fill = "white", color = "grey80", linetype = "solid") +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  scale_x_discrete(limits = c("Hormonal status", "Cluster", "RFP status"), expand = c(.05, .05)) +
+  theme(
+    axis.ticks = element_blank(),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill="white", colour = "white")
+    ) 
+
+# RFP -----------------------------------------------------
+df.allu <- meta %>% 
+  filter(in_silico_clusters != "Bas") %>% 
+  tibble::rownames_to_column( "cell_id") %>%
+  group_by(in_silico_clusters, treatment, lobe, rfp) %>%
+  dplyr::summarize(counts = n()) %>%
+  ungroup() %>%
+  dplyr::arrange(desc(counts))
+
+ggplot(df.allu, aes(y = counts, axis1 = treatment, axis2 = in_silico_clusters)) +
+  geom_alluvium(aes(fill = rfp), width = 1/6) +
+  scale_fill_manual(values = pal.rfp) +
+  geom_stratum(width = 0.25, fill = "white", color = "grey80", linetype = "solid") +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  scale_x_discrete(limits = c("Hormonal status", "Cluster", "RFP status"), expand = c(.05, .05)) +
+  theme(
+    axis.ticks = element_blank(),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill="white", colour = "white")
+    ) 
+
+ggplot(df.allu, aes(y = counts, axis1 = treatment, axis2 = rfp)) +
+  geom_alluvium(aes(fill = rfp), width = 1/6) +
+  scale_fill_manual(values = pal.rfp) +
+  geom_stratum(width = 0.25, fill = "white", color = "grey80", linetype = "solid") +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  scale_x_discrete(limits = c("Hormonal status", "Cluster", "RFP status"), expand = c(.05, .05)) +
+  theme(
+    axis.ticks = element_blank(),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill="white", colour = "white")
+    ) 
+```
+
+## F. Scanpy UMAP
+
+Read in coordinates
+```{r}
+cell_embedding <- 
+  read_csv("/sc_adult_dataset/paga_all_epithelial/output_umap/paga/cell_embedding.csv",
+           col_types = cols(.default = col_double(), Cell = col_character()))# %>% mutate(in_silico_clusters = colData(sce)$in_silico_clusters)
+```
+
+Add new UMAP layout to the seurat object
+```{r}
+new.UMAP <- cell_embedding %>% 
+  tibble::column_to_rownames("Cell") %>% 
+  dplyr::rename(UMAP1 = X, UMAP2 = Y) %>% 
+  as.matrix()
+
+sce[["umap.sc"]] <- CreateDimReducObject(embeddings = new.UMAP, key = "umap_", assay = "integrated")
+DimPlot(sce, reduction = "umap.sc", cols = pal.cl)
+```
+
+### => Save/Load PE
+
+```{r}
+sce.sc.umap <- sce
+saveRDS(sce.sc.umap, file = file.path("r_save/sce.sc.umap.rds"))
+```
+
+Load if need to start here
+```{r, eval=FALSE}
+sce <- readRDS(file.path("r_save/sce.sc.umap.rds"))
+```
+
+## G. Lum-D
+
+We subset cells of the Lum_D cluster, and perform DEA between intact and regressed cells of this cluster.
+
+### Filter
+
+*Keep Lum-D cluster*
+```{r}
+Idents(sce) <- "in_silico_clusters"
+lumd <- subset(sce, idents = c("Lum-D"), invert = FALSE)
+DimPlot(lumd, reduction = "umap", cols = pal.cl, pt.size = 1)
+```
+
+### UMAP/PCA
+
+```{r}
+DefaultAssay(lumd) <- "integrated"
+lumd <- RunPCA(lumd, npcs = 50, verbose = T, assay = "integrated")
+lumd <- RunUMAP(lumd, reduction = "pca", dims = 1:50, seed.use = 1, assay = "integrated", min.dist = 0.3)
+lumd <- FindNeighbors(lumd, reduction = "pca", dims = 1:50, assay = "integrated", k.param = 20L)
+lumd <- FindClusters(lumd, resolution = 0.8)
+DimPlot(lumd, reduction = "umap", cols = kel, label = TRUE, pt.size = 2)
+```
+
+Plot metadata
+```{r}
+pl1=DimPlot(lumd, group.by="population", pt.size=1, cols=pal.pop) + ggtitle("Sorted populations")
+pl2=DimPlot(lumd, group.by="treatment", pt.size=1, cols=pal.trt) + ggtitle("Hormonal status")
+pl3=DimPlot(lumd, group.by = "lobe", pt.size=1, cols=pal.lobe) + ggtitle("Lobes")
+pl4=DimPlot(lumd, group.by = "rfp", pt.size=1, cols=pal.rfp) + ggtitle("RFP status")
+(pl1+pl2)/(pl3+pl4)
+```
+
+### FindMarkers
+
+DEA between intact and regressed cells.  
+Use **MAST** algorithm.  
+
+```{r, eval=FALSE}
+Idents(lumd) <- "treatment"
+
+lumd.cas.markers <- FindMarkers(
+  lumd,
+  ident.1 = "Intact", 
+  ident.2 = "Regressed",
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = FALSE)
+
+# Top positive markers
+top.cas.lumd <- 
+  lumd.cas.markers %>% 
+  tibble::rownames_to_column(var="gene") %>% 
+  filter(p_val_adj<0.05)
+
+# write csv
+write.table(x = top.cas.lumd, file = paste0("r_export/", "lumD_diff.txt"), 
+            sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+FindAllMarkers
+```{r, eval=FALSE}
+Idents(lumd) <- "seurat_clusters"
+
+lumd.markers <- FindAllMarkers(
+  lumd,
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = FALSE)
+
+#saveRDS(lumd.markers, file = file.path("r_save/lumd.markers.rds"))
+
+# Top positive markers
+top10.lumd <- 
+  lumd.markers %>% 
+  group_by(cluster) %>% 
+  filter(avg_logFC>0) %>% 
+  top_n(n=10, wt=avg_logFC)
+
+```
+
+Genes
+```{r}
+#Idents(lumd) <- "lobe"
+feat <- c("Krt4", "Tacstd2", "Runx1", "Psca", "Mmp7", "Ccnd1")
+
+VlnPlot(lumd, features = feat, 
+        group.by = "lobe", 
+        split.by = "treatment",
+        assay = "RNA", 
+        cols = pal.trt, 
+        pt.size = 0.5,
+        adjust = ,)
+```
+
+### Violin Plots
+
+Function
+```{r}
+# Plot expression by cluster
+plotViolin_colByCluster <- function(GENE="Runx1", meta="treatment"){
+  
+  # Variables
+  g <- GENE
+  meta.to.plot <- meta # "Clusters", "Population", "Treatment", "RFP", "Lobe"
+  
+  # Change palette depending on which grouping variable is used
+  if (meta.to.plot == "in_silico_clusters") { 
+    pal=pal.cl
+  } else if (meta.to.plot == "population") {
+    pal=pal.pop
+  } else if (meta.to.plot == "treatment") {
+    pal=pal.trt
+  } else if (meta.to.plot == "rfp") {
+    pal=pal.rfp
+  } else if (meta.to.plot == "lobe") {
+    pal=pal.lobe
+  }
+  
+  # Extract gene expression
+  g.exp <- lumd[["RNA"]]@data[g,]
+  
+  # Extract corresponding metadata
+  df_plot <- lumd@meta.data %>% 
+    tibble::rownames_to_column(var = "CellBarcode") %>% 
+    dplyr::mutate(Gene = g.exp) %>% 
+    dplyr::rename(in_silico_clusters = in_silico_clusters,
+                  population = population,
+                  treatment = treatment,
+                  lobe = lobe,
+                  rfp = rfp)
+  
+  df_plot <- df_plot %>% 
+    dplyr::rename(GroupBy = !!as.name(meta.to.plot)) %>% 
+    dplyr::select(GroupBy, Gene, lobe)
+  
+  pViolgene <-
+  ggplot(df_plot, aes(x=lobe, y=Gene, colour=GroupBy)) +
+    geom_violin(fill=NA, scale="width", position = position_dodge(width = 0.8)) +
+    #geom_boxplot(position = position_dodge(width = 0.9), outlier.size = 0) +
+    geom_quasirandom(size = 0.4, alpha = 0.8, dodge.width = 0.8, varwidth = TRUE) +
+    scale_colour_manual(values=pal) +
+    theme_bw() +
+    theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank"),
+          #axis.line=element_blank(),
+          axis.text.x=element_blank(),
+          #axis.text.y=element_blank(),
+          #axis.ticks=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank()
+          ) +
+          #axis.text.x = element_text(angle = 0, hjust = 1)) +
+    labs(x ="", y = "", title = "")
+    
+  print(pViolgene)
+}
+```
+
+Selection
+```{r}
+plotViolin_colByCluster(GENE="Psca", meta="treatment")
+ggsave(filename = file.path(fig.dir, "6_LumD/LumD_Violin_Psca.png"), device = "png", width = 2.5, height = 2.5, dpi = 300)
+
+plotViolin_colByCluster(GENE="Krt4", meta="treatment")
+ggsave(filename = file.path(fig.dir, "6_LumD/LumD_Violin_Krt4.png"), device = "png", width = 2.5, height = 2.5, dpi = 300)
+
+plotViolin_colByCluster(GENE="Tacstd2", meta="treatment")
+ggsave(filename = file.path(fig.dir, "6_LumD/LumD_Violin_Tacstd2.png"), device = "png", width = 2.5, height = 2.5, dpi = 300)
+
+plotViolin_colByCluster(GENE="Runx1", meta="treatment")
+ggsave(filename = file.path(fig.dir, "6_LumD/LumD_Violin_Runx1.png"), device = "png", width = 2.5, height = 2.5, dpi = 300)
+
+plotViolin_colByCluster(GENE="Tspan1", meta="treatment")
+ggsave(filename = file.path(fig.dir, "6_LumD/LumD_Violin_Tspan1.png"), device = "png", width = 2.5, height = 2.5, dpi = 300)
+
+plotViolin_colByCluster(GENE="Nupr1", meta="treatment")
+ggsave(filename = file.path(fig.dir, "6_LumD/LumD_Violin_Nupr1.png"), device = "png", width = 2.5, height = 2.5, dpi = 300)
+
+plotViolin_colByCluster(GENE="Ar", meta="treatment")
+ggsave(filename = file.path(fig.dir, "6_LumD/LumD_Violin_Ar.png"), device = "png", width = 2.5, height = 2.5, dpi = 300)
+```
+
+## X. Paper Figures
+
+### UMAP
+
+```{r}
+#Original clusters
+sce <- AddMetaData(object = sce, metadata = seu_clus, col.name = "orig_seu_clus")
+DimPlot(sce, reduction = "umap.sc", cols = kel, pt.size = .8, group.by = "orig_seu_clus")
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_orig_seu_clusters.png"), device = "png", width = 6, height = 4, dpi = 300)
+DimPlot(sce, reduction = "umap.sc", cols = kel, pt.size = .8, group.by = "orig_seu_clus") + NoLegend() + NoAxes()
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_orig_seu_clusters_nolegend.png"), device = "png", width = 6, height = 6, dpi = 300)
+
+#Clusters
+DimPlot(sce, reduction = "umap.sc", cols = pal.cl, pt.size = 1)
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_clusters.png"), device = "png", width = 6, height = 4, dpi = 300)
+DimPlot(sce, reduction = "umap.sc", cols = pal.cl, pt.size = 1) + NoLegend() + NoAxes()
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_clusters_nolegend.png"), device = "png", width = 6, height = 6, dpi = 300)
+
+#Hormones
+DimPlot(sce, reduction = "umap.sc", group.by="treatment", pt.size=1, cols=pal.trt)
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_treatment.png"), device = "png", width = 6, height = 4, dpi = 300)
+DimPlot(sce, reduction = "umap.sc", group.by="treatment", pt.size=1, cols=pal.trt) + NoLegend() + NoAxes()
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_treatment_nolegend.png"), device = "png", width = 6, height = 6, dpi = 300)
+
+#Population
+DimPlot(sce, reduction = "umap.sc", group.by="population", pt.size=.8, cols=pal.pop2)
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_population.png"), device = "png", width = 6, height = 4, dpi = 300)
+DimPlot(sce, reduction = "umap.sc", group.by="population", pt.size=.8, cols=pal.pop2) + NoLegend() + NoAxes()
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_population_nolegend.png"), device = "png", width = 6, height = 6, dpi = 300)
+
+#Lobes
+DimPlot(sce, reduction = "umap.sc", group.by = "lobe", pt.size=1, cols=pal.lobe)
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_lobe.png"), device = "png", width = 6, height = 4, dpi = 300)
+DimPlot(sce, reduction = "umap.sc", group.by = "lobe", pt.size=1, cols=pal.lobe) + NoLegend() + NoAxes()
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_lobe_nolegend.png"), device = "png", width = 6, height = 6, dpi = 300)
+
+#RFP
+DimPlot(sce, reduction = "umap.sc",  group.by = "rfp", pt.size=1, cols=pal.rfp)
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_rfp.png"), device = "png", width = 6, height = 5, dpi = 300)
+DimPlot(sce, reduction = "umap.sc", group.by = "rfp", pt.size=1, cols=pal.rfp) + NoLegend() + NoAxes()
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_rfp_nolegend.png"), device = "png", width = 6, height = 6, dpi = 300)
+```
+
+### UMAP by population
+
+by individual population
+```{r}
+Idents(sce) <- "population"
+vec.pop <- levels(factor(as.vector(sce$population)))
+t  <- theme(axis.line=element_blank(),
+            axis.text.x=element_blank(),
+            axis.text.y=element_blank(),
+            axis.ticks=element_blank(),
+            axis.title.x=element_blank(),
+            axis.title.y=element_blank(),
+            legend.position="none",
+            panel.background=element_blank(),
+            panel.border=element_blank(),
+            panel.grid.major=element_line(color = "grey80", size = 0.5),
+            panel.grid.minor=element_blank(),
+            plot.background=element_blank())
+umap.coord <- as.data.frame(sce@reductions[["umap.sc"]]@cell.embeddings)
+xl <- c(min(umap.coord$umap_1), max(umap.coord$umap_1))
+yl <- c(min(umap.coord$umap_2), max(umap.coord$umap_2))
+
+
+
+for (i in seq_along(vec.pop)) {
+  
+  pop <- vec.pop[i]
+  o1 <- subset(sce, idents = pop, invert = FALSE)
+  DimPlot(o1, reduction = "umap.sc",group.by="population",pt.size=2,cols=pal.pop2[i])+NoLegend()+NoAxes()+t+xlim(xl)+ylim(yl)
+  ggsave(filename = file.path(fig.dir, paste0("2_pe/PE_POP_", pop, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+  
+}
+
+# All + grid
+DimPlot(sce, reduction = "umap.sc", group.by="population", pt.size=.8, cols=pal.pop2) + NoLegend() + NoAxes()+t+xlim(xl)+ylim(yl)
+ggsave(filename = file.path(fig.dir, "2_pe/PE_umap.sc_population_grid.png"), device = "png", width = 6, height = 6, dpi = 300)
+
+```
+
+
+### Dotplot
+
+Dotplot 1
+```{r}
+DefaultAssay(sce) <- "RNA"
+
+epi.markers.to.plot <- 
+  c(
+    "Epcam", "Krt8", "Cd24a", "Dpp4",
+    "Sbp", "Spink1", "Spink5",
+    "Tgm4", "Nkx3-1", "Pbsn",
+    "Msmb", "Wfdc3", "Itln1",
+    "Psca", "Krt4", "Wfdc2",
+    
+    "Clu", "Basp1", "Sprr1a",
+    "Crym", "Ang5", "Fabp5",
+                         
+    "Krt5", "Krt14", "Trp63"
+    )
+
+DotPlot(
+  sce, 
+  features = rev(epi.markers.to.plot), 
+  group.by = "in_silico_clusters",
+  cols = c("darkblue", "tomato"), 
+  dot.scale = 5) + 
+  RotatedAxis() + 
+  labs(x="Genes", y="In Silico Clusters")
+
+ggsave(filename = file.path(fig.dir, "2_pe/PE_dotplot1.pdf"), width = 10, height = 6, device = "pdf")
+
+
+DotPlot(sce, 
+        features = rev(epi.markers.to.plot), 
+        group.by = "in_silico_clusters",
+        cols = c("darkblue", "tomato"), dot.scale = 6) + RotatedAxis()
+
+ggsave(filename = file.path(fig.dir, "2_pe/PE_dotplot1.png"), device = "png", width = 8, height = 4, dpi = 300)
+```
+
+Dotplot 2 (choice)
+```{r}
+DefaultAssay(sce) <- "RNA"
+
+epi.markers.to.plot <- 
+  c(
+    "Epcam", "Krt8", "Cd24a", "Dpp4",
+    "Sbp", "Spink1", "Spink5",
+    "Tgm4", "Nkx3-1", "Pbsn",
+    "Msmb", "Wfdc3", "Itln1",
+    "Psca", "Krt4", "Wfdc2",
+    
+    "Clu", "Basp1", "Lpl",
+    "Car2", "Crym", "Ang5", "Fabp5", 
+                         
+    "Krt5", "Krt14", "Trp63"
+    )
+
+DotPlot(
+  sce, 
+  features = rev(epi.markers.to.plot), 
+  group.by = "in_silico_clusters",
+  cols = c("darkblue", "tomato"), 
+  dot.scale = 5) + 
+  RotatedAxis() + 
+  labs(x="Genes", y="In Silico Clusters")
+
+ggsave(filename = file.path(fig.dir, "2_pe/PE_dotplot2.pdf"), width = 10, height = 6, device = "pdf")
+
+
+DotPlot(sce, 
+        features = rev(epi.markers.to.plot), 
+        group.by = "in_silico_clusters",
+        cols = c("darkblue", "tomato"), dot.scale = 6) + RotatedAxis()
+
+ggsave(filename = file.path(fig.dir, "2_pe/PE_dotplot2.png"), device = "png", width = 9, height = 4, dpi = 300)
+```
+
+### Heatmap
+
+Top 10 marker genes of each cluster
+```{r}
+library(viridis)
+
+DoHeatmap(object = sce,
+          features = top10.epi$gene, 
+          group.colors = pal.cl, 
+          assay = "RNA", 
+          slot = "data", 
+          size = 4, 
+          draw.lines = TRUE, 
+          lines.width = 10) + scale_fill_viridis(na.value="white", option="inferno", begin = 0.1)
+
+ggsave(filename = file.path(fig.dir, "2_pe/PE_heatmap_top10.png"), device = "png", width = 6, height = 9, dpi = 300)
+```
+
+### Genes 
+
+```{r}
+source("r_scripts/functions.R")
+# Extract UMAPs coordinates
+sce.UMAP <- as.data.frame(Embeddings(sce[["umap.sc"]]))
+sce.UMAP <- sce.UMAP %>% 
+  dplyr::mutate(CellBarcode = colnames(sce),
+                Clusters = sce$seurat_clusters,
+                Population = sce$population,
+                Treatment = sce$treatment,
+                Lobe = sce$lobe,
+                RFP = sce$rfp)
+
+# Runx1
+gene <- "Runx1"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Nkx3-1
+gene <- "Nkx3-1"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Spink1
+gene <- "Spink1"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Msmb
+gene <- "Msmb"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Tgm4
+gene <- "Tgm4"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Pbsn
+gene <- "Pbsn"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Ar
+gene <- "Ar"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Tacstd2
+gene <- "Tacstd2"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt4
+gene <- "Krt4"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt8
+gene <- "Krt8"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt18
+gene <- "Krt18"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt5
+gene <- "Krt5"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Trp63
+gene <- "Trp63"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Epcam
+gene <- "Epcam"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Cd49f
+gene <- "Itga6"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Cd24a
+gene <- "Cd24a"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt7
+gene <- "Krt7"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt19
+gene <- "Krt19"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Runx2
+gene <- "Runx2"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+# Runx3
+gene <- "Runx3"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+# Cbfb
+gene <- "Cbfb"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Hoxb13
+gene <- "Hoxb13"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Foxa1
+gene <- "Foxa1"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Ly6d
+gene <- "Ly6d"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Ly6e
+gene <- "Ly6e"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Ly6a
+gene <- "Ly6a"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+
+# Psca
+gene <- "Psca"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt14
+gene <- "Krt14"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Apoe
+gene <- "Apoe"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Krt15
+gene <- "Krt15"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Cdh1
+gene <- "Cdh1"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Dpp4
+gene <- "Dpp4"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Dcn
+gene <- "Dcn"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+### --- CAS
+
+# Clu
+gene <- "Clu"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Basp1
+gene <- "Basp1"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Sprr1a
+gene <- "Sprr1a"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Crip1
+gene <- "Crip1"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Lpl
+gene <- "Lpl"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Thbs1
+gene <- "Thbs1"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Car2
+gene <- "Car2"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+# Crym
+gene <- "Crym"
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "yes")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, ".png")), device = "png", width = 6, height = 6, dpi = 300)
+plotUMAP_colByGene(sce, sce.UMAP, gene, ptsize = 1, alpha = 1, legend = "minimal")
+ggsave(filename = file.path(fig.dir, paste0("3_pe_geneplots/PE_Gene_", gene, "_minimal",".png")), device = "png", width = 6, height = 6, dpi = 300)
+
+
+```
+
+### Metadata
+
+```{r}
+meta = sce@meta.data
+
+### --- Number of epithelial cells per sorted population ------------------------------------
+
+stat <- 
+  meta %>% 
+  group_by(population) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+ggplot(stat, aes(x=(population), y=count, fill=population)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(y=count,label = count, hjust=-0.2)) +
+  scale_fill_manual(values = pal.pop2) +
+  labs(x="Sorted population", y="Number of cells") +
+  scale_y_continuous(limits=c(0, max(stat$count) + 0.1*max(stat$count))) +
+   theme(
+               
+     axis.title.x=element_blank(),
+     axis.title.y=element_blank(),
+     axis.text.y=element_blank(),
+     
+     legend.position = "none",
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+ggsave(filename = file.path(fig.dir, "Meta_PE_n_population.png"), device = "png", width = 3, height = 3, dpi = 300)
+
+### --- Number of epithelial cells per RFP ------------------------------------
+
+stat <- 
+  meta %>% 
+  group_by(rfp) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+ggplot(stat, aes(x=rfp, y=count, fill=rfp)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(y=count,label = count, hjust=-0.2)) +
+  scale_fill_manual(values = pal.rfp) +
+  labs(x="Sorted population", y="Number of cells") +
+  scale_y_continuous(limits=c(0, max(stat$count) + 0.2*max(stat$count))) +
+   theme(
+          
+     axis.title.x=element_blank(),
+     axis.title.y=element_blank(),
+     axis.text.y=element_blank(),
+     
+     legend.position = "none",
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+ggsave(filename = file.path(fig.dir, "Meta_PE_n_rfp.png"), device = "png", width = 3, height = 1, dpi = 300)
+
+### --- Number of epithelial cells per Treatment ------------------------------------
+
+stat <- 
+  meta %>% 
+  group_by(treatment) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+ggplot(stat, aes(x=treatment, y=count, fill=treatment)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(y=count,label = count, hjust=-0.2)) +
+  scale_fill_manual(values = pal.trt) +
+  labs(x="Sorted population", y="Number of cells") +
+  scale_y_continuous(limits=c(0, max(stat$count) + 0.2*max(stat$count))) +
+   theme(
+          
+     axis.title.x=element_blank(),
+     axis.title.y=element_blank(),
+     axis.text.y=element_blank(),
+     
+     legend.position = "none",
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+ggsave(filename = file.path(fig.dir, "Meta_PE_n_treatment.png"), device = "png", width = 3, height = 1, dpi = 300)
+
+### --- Number of epithelial cells per Lobe ------------------------------------
+
+stat <- 
+  meta %>% 
+  group_by(lobe) %>% 
+  summarise(count=n()) %>% 
+  mutate(perc=(count/sum(count)*100))
+
+ggplot(stat, aes(x=lobe, y=count, fill=lobe)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(y=count,label = count, hjust=-0.2)) +
+  scale_fill_manual(values = pal.lobe) +
+  labs(x="Sorted population", y="Number of cells") +
+  scale_y_continuous(limits=c(0, max(stat$count) + 0.2*max(stat$count))) +
+   theme(
+          
+     axis.title.x=element_blank(),
+     axis.title.y=element_blank(),
+     axis.text.y=element_blank(),
+     
+     legend.position = "none",
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+ggsave(filename = file.path(fig.dir, "Meta_PE_n_lobe.png"), device = "png", width = 3, height = 1.4, dpi = 300)
+
+```
+
+Sankey
+```{r}
+df.allu <- meta %>% 
+  filter(in_silico_clusters != "Bas") %>% 
+  tibble::rownames_to_column( "cell_id") %>%
+  group_by(in_silico_clusters, treatment, lobe, rfp) %>%
+  dplyr::summarize(counts = n()) %>%
+  ungroup() %>%
+  dplyr::arrange(desc(counts))
+
+# Treatment|Clusters|RFP / colour by lobe  -----------------------------------
+ggplot(df.allu, aes(y = counts, axis1 = treatment, axis2 = in_silico_clusters, axis3 = factor(rfp, levels = c("Low", "High")))) +
+  geom_alluvium(aes(fill = lobe), width = 1/6) +
+  scale_fill_manual(values = pal.lobe) +
+  geom_stratum(width = 0.25, fill = "white", color = "grey80", linetype = "solid") +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  scale_x_discrete(limits = c("Hormonal status", "Cluster", "RFP status"), expand = c(.05, .05)) +
+  theme(
+    legend.position = "none",
+    axis.ticks = element_blank(),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill="white", colour = "white")) 
+
+ggsave(filename = file.path(fig.dir, "/sankey/Sankey_lobes.pdf"), device = "pdf", width = 10, height = 8, dpi = 300)
+
+
+# Treatment|Clusters|RFP / colour by rfp  -----------------------------------
+ggplot(df.allu, aes(y = counts, axis1 = treatment, axis2 = in_silico_clusters, axis3 = factor(rfp, levels = c("Low", "High")))) +
+  geom_alluvium(aes(fill = rfp), width = 1/6) +
+  scale_fill_manual(values = pal.rfp) +
+  geom_stratum(width = 0.25, fill = "white", color = "grey80", linetype = "solid") +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  scale_x_discrete(limits = c("Hormonal status", "Cluster", "RFP status"), expand = c(.05, .05)) +
+  theme(
+    legend.position = "none",
+    axis.ticks = element_blank(),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill="white", colour = "white")) 
+
+ggsave(filename = file.path(fig.dir, "/sankey/Sankey_rfp.pdf"), device = "pdf", width = 10, height = 8, dpi = 300)
+
+
+# Treatment|Clusters|RFP / colour by treatment  -----------------------------------
+ggplot(df.allu, aes(y = counts, axis1 = treatment, axis2 = in_silico_clusters, axis3 = factor(rfp, levels = c("Low", "High")))) +
+  geom_alluvium(aes(fill = treatment), width = 1/6) +
+  scale_fill_manual(values = pal.trt) +
+  geom_stratum(width = 0.25, fill = "white", color = "grey80", linetype = "solid") +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  scale_x_discrete(limits = c("Hormonal status", "Cluster", "RFP status"), expand = c(.05, .05)) +
+  theme(
+    legend.position = "none",
+    axis.ticks = element_blank(),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill="white", colour = "white")) 
+
+ggsave(filename = file.path(fig.dir, "/sankey/Sankey_treatment.pdf"), device = "pdf", width = 10, height = 8, dpi = 300)
+
+
+# Treatment|Clusters|RFP / colour by clusters  -----------------------------------
+ggplot(df.allu, aes(y = counts, axis1 = treatment, axis2 = in_silico_clusters, axis3 = factor(rfp, levels = c("Low", "High")))) +
+  geom_alluvium(aes(fill = in_silico_clusters), width = 1/6) +
+  scale_fill_manual(values = pal.cl) +
+  geom_stratum(width = 0.25, fill = "white", color = "grey80", linetype = "solid") +
+  geom_text(stat = "stratum", infer.label = TRUE) +
+  scale_x_discrete(limits = c("Hormonal status", "Cluster", "RFP status"), expand = c(.05, .05)) +
+  theme(
+    legend.position = "none",
+    axis.ticks = element_blank(),
+    axis.title.y=element_blank(),
+    axis.text.y=element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    strip.background = element_rect(fill="white", colour = "white")) 
+
+ggsave(filename = file.path(fig.dir, "/sankey/Sankey_clusters.pdf"), device = "pdf", width = 10, height = 8, dpi = 300)
+```
+
+--------------------------------------------------------------------------------
+## Session Information
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,906 @@
+---
+title: "Explant scRNAseq datasets analysis"
+subtitle: "Scanpy PAGA"
+author: "Renaud Mevel"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, cache.lazy = TRUE)
+```
+
+## Objective
+
+Import and plot data generated in scanpy, including ForceAtlas2/Neighborhood graph and PAGA.
+
+## Prepare the environment
+
+```{r , warning=FALSE, message=FALSE}
+# Data wrangling
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(data.table)
+
+# Plots
+library(gridExtra)
+library(ggpubr)
+library(viridis)
+# sc
+library(Seurat)
+library(sctransform)
+library(MAST)
+library(org.Mm.eg.db)
+library(DoubletFinder)
+library(slingshot)
+
+# GO
+library(gprofiler2)
+
+# Palettes
+pal.sa <- c("#DC2B19", "#F7A400", "#72ABF8", "#434CA7")
+pal.sa.vi <- viridis(4,begin = 0.05, end = 0.95)
+
+pal.cl <- c(
+  "#F09900", #C0
+  "#F1BA88", #C1
+  "#D63A69", #C2
+  "#9DDED6", #C3
+  "#8DD593", #C4
+  "#428654", #C5
+  "#B2B8E0", #C6
+  "#4A6FE3", #C7
+  "#1037AA"  #C8 
+)
+
+# Directories
+setwd(dir = "~/set-directory/")
+pdf.dir <- "~/set-directory/"
+fig.dir <- "~/set-directory/"
+
+# Functions
+source("Explant_functions.R")
+
+# Seed
+set.seed(1)
+```
+
+## Functions 1
+
+```{r}
+plotPAGAClustGraph <- function(embedding, edges, thresh = 0, colour = "in_silico_clusters") {
+
+    is_discrete <- is.factor(embedding[[colour]])
+
+    gg <- ggplot(embedding, aes(x = X, y = Y))
+
+    if (is_discrete) {
+        gg <- gg +
+            geom_segment(data = filter(edges, Connectivity > thresh),
+                         aes(x = FromX, y = FromY, xend = ToX, yend = ToY, #alpha = Connectivity
+                             colour = Connectivity), size = (edges$Connectivity)*10 ) +
+            scale_colour_viridis_c(direction = 1, begin = 0.2, end = 0.6, option="inferno")
+    } else {
+        gg <- gg +
+            geom_segment(data = filter(edges, Connectivity > thresh),
+                         aes(x = FromX, y = FromY, xend = ToX, yend = ToY,
+                             alpha = Connectivity), colour = "grey30") +
+            scale_alpha(limits = c(0, 1)) +
+            scale_fill_viridis_c()
+    }
+
+    gg <- gg +
+        geom_point(aes(fill = !!ensym(colour), size = Size), shape = 21) +
+        scale_fill_manual(values = pal.cl) +
+        geom_text(aes(label = in_silico_clusters)) +
+        scale_size(range = c(5, 20)) +
+        theme_void() +
+        theme(legend.position = "none")
+
+    return(gg)
+}
+
+
+###  -----------------------------------------
+
+plotPAGACellGraph <- function(embedding, edges, thresh = 0, colour = "in_silico_clusters", label = FALSE) {
+
+    is_discrete <- is.factor(embedding[[colour]])
+
+    gg <- ggplot(embedding, aes(x = X, y = Y, colour = !!ensym(colour))) +
+        geom_segment(data = filter(edges, Connectivity > thresh),
+                     aes(x = FromX, y = FromY, xend = ToX, yend = ToY),
+                     size = 0.1, colour = "grey50") +
+        geom_point(size = 0.5, aes(colour = in_silico_clusters)) +
+        scale_colour_manual(values = pal.cl) +
+        theme_void() +
+        theme(legend.position = "none")
+
+    if (!is_discrete) {
+        gg <- gg + scale_color_viridis_c()
+    }
+
+    if (label) {
+        clust_data <- embedding %>%
+            group_by(in_silico_clusters) %>%
+            summarise(X = mean(X),
+                      Y = mean(Y))
+
+        gg <- gg +
+          #geom_point(data = clust_data, aes(fill = in_silico_clusters),
+          #             size = 10, shape = 21, colour = "white") +
+          scale_fill_manual(values = pal.cl) +
+          geom_text(data = clust_data, aes(label = in_silico_clusters),
+                      colour = "black")
+    }
+
+    return(gg)
+}
+
+###  -----------------------------------------
+
+plotPAGACompare <- function(clust_embedding, clust_edges, clust_thresh = 0,
+                            cell_embedding, cell_edges, cell_thresh = 0,
+                            colour = NA, label = FALSE) {
+
+    clusts <- plotPAGAClustGraph(clust_embedding, clust_edges, clust_thresh,
+                                 colour)
+
+    cells <- plotPAGACellGraph(cell_embedding, cell_edges, cell_thresh,
+                               colour, label)
+
+    cowplot::plot_grid(clusts, cells, nrow = 1)
+}
+```
+
+
+## Functions 2 
+
+Function to plot genes in PAGA and FA
+```{r}
+
+##### In PAGA space ---------------------------------------------------------
+plotPAGAgene <- function(scdata, cl.embedding, cl.edges, sc.embedding, gene = "Runx1", legend=TRUE, thresh=0, show.clusters=FALSE, rm.cl = NA) {
+  
+  # remove cluster if asked
+  if (!is.na(rm.cl)) { 
+    cl.embedding <- dplyr::filter(cl.embedding, in_silico_clusters != rm.cl)
+    cl.edges <- dplyr::filter(cl.edges, From != rm.cl, To != rm.cl)
+    }
+  
+  sc.embedding[[gene]] <- logcounts(scdata)[gene, ]
+  
+  paga_gene <- sc.embedding %>%
+    dplyr::select(-Cell, -X, -Y) %>%
+    group_by(in_silico_clusters) %>%
+    summarise_all(mean)
+  
+  paga_gene[, gene][paga_gene[, gene] == 0] <- NA 
+  
+  max.scale = max(paga_gene[[gene]])
+  min.scale = min(paga_gene[[gene]], na.rm = TRUE)
+  
+  paga_embedding <- left_join(cl.embedding, paga_gene, by = "in_silico_clusters")
+  
+  cl.edges <- cl.edges %>% mutate(Connectivity = ifelse(Connectivity < thresh, NA, Connectivity))
+  
+  g <- ggplot(paga_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = cl.edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY), size = (cl.edges$Connectivity)*10, alpha=0.5) +
+  geom_point(aes(fill = !!ensym(gene), size = Size), shape = 21, colour="grey30") +
+  scale_fill_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 0.9, limits = c(min.scale, max.scale)) +
+  scale_size(range = c(6, 12), guide = FALSE) +
+  theme_void()
+  
+  if (legend==FALSE) { g <- g + theme(legend.position = "none") }
+  if (show.clusters==TRUE) { g <- g + geom_text(aes(label = in_silico_clusters)) }
+  g
+}
+
+##### In ForceAtlas space ---------------------------------------------------------
+
+plotFAgene <- function(scdata, cell.embedding, cell.edges, gene, legend=TRUE, pt.size=0.8, show.connections=TRUE, thresh=0) {
+  
+  cell.embedding[[gene]] <- logcounts(scdata)[gene, ]
+  
+  cell.embedding[, 5][cell.embedding[, 5] == 0] <- NA # replace 0 with NA
+  
+  max.scale = max(cell.embedding[[gene]])
+  min.scale = min(cell.embedding[[gene]], na.rm = TRUE)
+  
+  cell.edges <- cell.edges %>% mutate(Connectivity = ifelse(Connectivity < thresh, NA, Connectivity))
+  
+  g <- ggplot(cell.embedding, aes(x = X, y = Y))
+  
+    if (show.connections==TRUE) { 
+  g <- g + geom_segment(data = cell.edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, size = Connectivity, alpha = Connectivity), colour="grey50")
+  g <- g + scale_alpha_continuous(limits = c(0, 1), range = c(0.2, 1), guide = FALSE)
+  g <- g + scale_size(range = c(0.1, 0.5), guide = FALSE)
+  }
+  
+  g <- g + geom_point(aes(colour = !!ensym(gene)), size=pt.size)
+  g <- g + scale_colour_viridis_c(option = "plasma", na.value = "grey80", end = 1, limits = c(min.scale, max.scale))
+  g <- g + theme_void()
+
+  if (legend==FALSE) { g <- g + theme(legend.position = "none") }
+  
+  g
+}
+```
+
+
+## Load data
+
+```{r}
+seu <- readRDS(file.path("r_save/sce_final.diffmap.rds"))
+
+# Drop C9 level
+relevel <- c("C0", "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8")
+Idents(seu) <- factor(Idents(seu), levels = relevel)
+seu$in_silico_clusters <- Idents(seu)
+
+sce <- as.SingleCellExperiment(seu, assay = "RNA")
+```
+
+## Load PAGA
+
+### Load embeddings
+
+```{r}
+# cluster embeddings--------------------------------------------------------------------------
+clust_embedding <- read_csv("scanpy_paga/cluster_embedding.csv",
+                            col_types = cols(.default = col_double())) %>%
+  mutate(Size = as.numeric(table(colData(sce)$in_silico_clusters))) %>%
+  dplyr::rename(Cluster = in_silico_clusters) %>% 
+  mutate(Cluster = factor(Cluster)) %>% 
+  mutate(in_silico_clusters = factor(names(table(colData(sce)$in_silico_clusters)), levels = levels(colData(sce)$in_silico_clusters)))
+
+# cluster edges--------------------------------------------------------------------------------
+clust_edges <- read_csv("scanpy_paga/cluster_edges.csv",
+                        col_types = cols(.default = col_double()))  %>%
+  mutate(To = factor(To, levels = levels(clust_embedding$Cluster)),
+         From = factor(From, levels = levels(clust_embedding$Cluster))) %>%
+    left_join(clust_embedding, by = c("From" = "Cluster")) %>%
+    dplyr::rename(FromX = X, 
+                  FromY = Y,
+                  From_in_silico_clusters = in_silico_clusters) %>%  
+    dplyr::select(-Size) %>%
+    left_join(clust_embedding, by = c("To" = "Cluster")) %>%
+    dplyr::rename(ToX = X, 
+                  ToY = Y, 
+                  To_in_silico_clusters = in_silico_clusters) %>%
+    dplyr::select(-Size)
+
+# remove 'Cluster'----------------------------------------------------------------------------
+clust_embedding <- dplyr::select(clust_embedding, -Cluster)
+clust_edges <- clust_edges %>% 
+  dplyr::mutate(From = From_in_silico_clusters,
+                To = To_in_silico_clusters) %>% 
+  dplyr::select(-From_in_silico_clusters, -To_in_silico_clusters)
+
+# cell embeddings----------------------------------------------------------------------------
+cell_embedding <- read_csv("scanpy_paga/cell_embedding.csv",
+                           col_types = cols(.default = col_double(), Cell = col_character())
+                           ) %>%
+  mutate(in_silico_clusters = colData(sce)$in_silico_clusters)
+
+# cell edges ---------------------------------------------------------------------------------
+cell_edges <- read_csv("scanpy_paga/cell_edges.csv",
+                        col_types = cols(.default = col_double(), From = col_character(), To = col_character())
+                       )  %>%
+  dplyr::left_join(cell_embedding, by = c("From" = "Cell")) %>%
+  dplyr::rename(FromX = X, FromY = Y) %>%
+  dplyr::select(-in_silico_clusters) %>%
+  dplyr::left_join(cell_embedding, by = c("To" = "Cell")) %>%
+  dplyr::rename(ToX = X, ToY = Y) %>%
+  dplyr::select(-in_silico_clusters)
+
+# pseudotime ----------------------------------------------------------------------------
+dpt_pseudotime <- read_csv("scanpy_paga/dpt_pseudotime.csv", 
+                           col_types = cols(.default = col_character(), dpt_pseudotime = col_double())) %>% 
+  tibble::column_to_rownames(var = "X1")
+```
+
+### FA > Seurat
+
+Add FA layout to the seurat object
+```{r}
+FA <- cell_embedding %>% 
+  column_to_rownames("Cell") %>% 
+  dplyr::select(-in_silico_clusters) %>% 
+  dplyr::rename(FA1 = X, FA2 = Y) %>% 
+  as.matrix()
+
+seu[["FA"]] <- CreateDimReducObject(embeddings = FA, key = "FA_", assay = DefaultAssay(seu))
+DimPlot(seu, reduction = "FA", cols = pal.cl)
+```
+
+Add dpt_pseudotime
+```{r}
+seu[["dpt_pseudotime"]] <- dpt_pseudotime
+FeaturePlot(seu, reduction = "FA", features = "dpt_pseudotime") + scale_colour_viridis(option = "viridis")
+```
+
+Convert back to SingleCellExperiment
+```{r}
+sce <- as.SingleCellExperiment(seu, assay = "RNA")
+```
+
+## Save obkect
+
+```{r}
+saveRDS(seu, file =  "r_save/sce_final_paga_fa_dpt.rds")
+```
+
+## Visualise Scanpy output
+
+### Cluster graph
+
+```{r}
+plotPAGAClustGraph(clust_embedding, clust_edges, thresh = 0)
+```
+
+### Edges threshold
+
+Number of selected edges for different threshold connectivities.
+```{r}
+plot_data <- tibble(
+    Threshold = seq(0, 1, 0.01)
+) %>%
+    mutate(Edges = map_int(Threshold, function(thresh) {
+        sum(clust_edges$Connectivity > thresh)
+    }))
+
+con_thresh <- 0.7
+
+ggplot(plot_data, aes(x = Threshold, y = Edges)) +
+    geom_point() +
+    geom_line() +
+    geom_vline(xintercept = con_thresh, colour = "red") +
+    xlab("Connectivity threshold") +
+    ylab("Number of edges") +
+    theme_minimal()
+```
+
+### Cell graph
+
+```{r}
+plotPAGACellGraph(cell_embedding, cell_edges, thresh = 0.0)
+```
+
+### Compare
+
+```{r}
+plotPAGACompare(clust_embedding, clust_edges, clust_thresh = 0,
+                cell_embedding, cell_edges, cell_thresh = 0, colour = "in_silico_clusters")
+```
+
+### Gene expression
+
+Bac a sable
+In PAGA
+```{r}
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Nkx3-1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Runx1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Tacstd2")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Mki67")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Psca")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt4")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Nupr1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Meis2")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Shh")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Ar")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Foxa1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Etv1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Etv4")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Gata2")
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Trp63")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Apoe")
+
+(
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt5") /
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt14") /
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt7") /
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt19") 
+) | (
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt8")/
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt18")/
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt17")/
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt4")
+)
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Gsto1")
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Cd24a")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Itga6")
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Dpp4")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt20")
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Sox2")
+```
+
+In ForceAtlas
+```{r}
+plotFAgene(sce, cell_embedding, cell_edges, gene = "Runx1", pt.size = 1, thresh=0, show.connections = TRUE, legend=FALSE)
+plotFAgene(sce, cell_embedding, cell_edges, gene = "Nkx3-1", pt.size = 1, thresh=0, show.connections = TRUE, legend=FALSE)
+plotFAgene(sce, cell_embedding, cell_edges, gene = "Shh", pt.size = 1, thresh=0, show.connections = TRUE)
+```
+
+#### Genes in PAGA
+
+```{r}
+gene <- "Runx1"
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Nkx3-1"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Tacstd2"
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Krt4"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Psca"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Psca"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Nupr1"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Nupr1"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Krt5"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Krt14"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Krt8"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Krt18"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Krt7"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Trp63"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Dcn"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Apoe"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Shh"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Notch1"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Meis2"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Mki67"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Top2a"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Hoxd13"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Hoxb13"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Sox9"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Ly6d"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Ly6a"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Ly6e"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Krt19"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Ar"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Foxa1"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Vcan"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Itga6"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+gene <- "Cd24a"
+#plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene)
+#ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, ".png")), device = "png", width = 5, height = 5, dpi = 300)
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = gene, legend = FALSE)
+ggsave(filename = file.path(fig.dir, paste0("6_paga/genes/PAGA_", gene, "_minimal",".png")), device = "png", width = 4, height = 4, dpi = 300)
+
+```
+
+#### Runx1/Nkx3-1
+
+Plot cells which have co-expression of Runx1 and Nkx3-1
+
+```{r}
+known_genes <- c("Runx1", "Nkx3-1")
+
+sc_embedding <- cell_embedding
+
+for (gene in known_genes) {
+    sc_embedding[[gene]] <- logcounts(sce)[gene, ]
+}
+
+sc_embedding <- sc_embedding %>% 
+  mutate(cutoff = 0.1) %>% 
+  mutate(coexpr = ifelse(Runx1 > cutoff & `Nkx3-1` > cutoff, "yes", "no"))
+
+ggplot(sc_embedding, aes(x = X, y = Y)) +
+  geom_point(aes(colour = coexpr), size=1, alpha=0.9) + 
+  scale_colour_manual(values = c("grey80", "darkblue")) + 
+  theme_void()
+
+
+meta = seu@meta.data
+known_genes <- c("Runx1", "Nkx3-1")
+for (gene in known_genes) { meta[[gene]] <- logcounts(sce)[gene, ] }
+meta <- meta %>% 
+  mutate(cutoff = 0) %>% 
+  mutate(coexpr = ifelse(Runx1 > cutoff & `Nkx3-1` > cutoff, "yes", "no"))
+
+# Propotion by day
+stat1 <- 
+  meta %>% 
+  dplyr::group_by(sample, coexpr) %>% 
+  dplyr::summarise(count=n()) %>% 
+  dplyr::mutate(perc=(count/sum(count)*100))
+
+ggplot(stat1, aes(x = sample, y = perc, fill = coexpr, label = count)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("grey80","#6D8FBA")) +
+  labs(x="Days", y="Percentage", fill="Co-expression") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+
+# Proportion by cluster
+stat2 <- 
+  meta %>% 
+  dplyr::group_by(in_silico_clusters, coexpr) %>% 
+  dplyr::summarise(count=n()) %>% 
+  dplyr::mutate(perc=(count/sum(count)*100))
+
+ggplot(stat2, aes(x = in_silico_clusters, y = perc, fill = coexpr, label = count)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("grey80","#6D8FBA")) +
+  labs(x="Clusters", y="Percentage", fill="Co-expression") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+```
+
+#### Genes in pseudotime
+
+```{r}
+ExpUMAP_pseudo1 <- function(sceObje, gNAME){
+  g <- gNAME
+  #g.exp <- assay(sceObje, "logcounts")[g, ]
+  g.exp <- sceObje[["RNA"]]@data[g,]
+  df_plot <- data.frame(DPT = sceObje[["dpt_pseudotime"]]$dpt_pseudotime,
+                        Gene = g.exp,
+                        Population = sceObje$in_silico_clusters)
+  #colp_fun <- df_col$Col[df_col$in_silico_clusters %in% sceObje$in_silico_clusters]
+  pUMAPf <-
+    ggplot(df_plot,
+           aes(x=DPT, y=Gene, colour=Population)) +
+    geom_point(size=1.5) +
+    geom_smooth(colour="red", method="loess", se=TRUE, size=0.5) +
+    scale_colour_manual(values=pal.cl) +
+    theme_bw() +
+    theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank")) +
+    #geom_vline(xintercept = ps_ar_1, linetype = "dashed", size=0.5, colour="grey80") +
+    labs(subtitle = gNAME) +
+    ylab("Expression") +
+    xlab("Pseudotime") #+ xlim(c(0.6,1))
+  
+  print(pUMAPf)
+}
+
+ExpUMAP_pseudo1(seu,"Runx1")
+ExpUMAP_pseudo1(seu,"Nkx3-1")
+ExpUMAP_pseudo1(seu,"Tacstd2")
+```
+
+#### Violin plots
+
+```{r}
+t = theme(axis.text.x = element_text(angle = 0))
+VlnPlot(seu, features = c("Nkx3-1"), cols = pal.cl, pt.size = 0, group.by = "in_silico_clusters")# + NoLegend() + t
+#ggsave(filename = file.path(fig.dir, "QC_before_genes.png"), device = "png", width = 4, height = 3, dpi = 300)
+```
+
+#### Heatmap
+
+```{r}
+geneList = c( 'Shh', "Foxa1", 'Notch1', 'Sox9', 'Hoxb13', 'Hoxd13', 'Ar', "Nkx3-1",  "Trp63", 'Wnt5a',
+              'Krt5', 'Krt14', "Krt8", "Krt18", "Krt19", "Krt7",
+              "Dcn", "Apoe", "Ly6a", "Ly6e",
+              'Psca', 'Nupr1', 'Krt4', "Tacstd2", "Ly6d",
+              'Mki67', 'Top2a')
+
+
+DoHeatmap(object = seu, features = as.character(geneList), group.colors = pal.cl, draw.lines = TRUE, lines.width = 10,
+          assay = "RNA", slot = "data", size = 4) + scale_fill_viridis(option = "viridis",na.value = "white")
+```
+
+
+## PAGA/FA Figures
+
+### ggplot
+
+Coloured connections
+```{r, eval=FALSE}
+ggplot(clust_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = clust_edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, colour = Connectivity, alpha = Connectivity), 
+               size = (clust_edges$Connectivity)*8) +
+  scale_colour_viridis_c(direction = 1, begin = 0.2, end = 0.6, option="inferno") +
+  scale_alpha_continuous(limits = c(0, 1), range = c(0.7, 0.9), guide = FALSE) +
+  geom_point(aes(fill = in_silico_clusters, size = Size), shape = 21, colour="white") +
+  scale_fill_manual(values = pal.cl) +
+  scale_size(range = c(5, 10), guide = FALSE) +
+  theme_void()  #+ scale_y_reverse() + coord_flip() 
+
+ggsave(filename = file.path(fig.dir, "6_paga/PAGA_clusters_c.png"), device = "png", width = 5, height = 5, dpi = 300)
+
+
+ggplot(clust_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = clust_edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, colour = Connectivity, alpha = Connectivity), 
+               size = (clust_edges$Connectivity)*8) +
+  scale_colour_viridis_c(direction = 1, begin = 0.2, end = 0.6, option="inferno") +
+  scale_alpha_continuous(limits = c(0, 1), range = c(0.7, 0.9), guide = FALSE) +
+  geom_point(aes(fill = in_silico_clusters, size = Size), shape = 21, colour="white") +
+  scale_fill_manual(values = pal.cl) +
+  scale_size(range = c(5, 10), guide = FALSE) +
+  theme_void() + theme(legend.position = "none")# + scale_y_reverse() + coord_flip() 
+
+ggsave(filename = file.path(fig.dir, "6_paga/PAGA_clusters_c_nolegend.png"), device = "png", width = 5, height = 5, dpi = 300)
+
+```
+
+PAGA - Black connections
+```{r}
+ggplot(clust_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = clust_edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, alpha = Connectivity), 
+               size = (clust_edges$Connectivity)*8, lineend="round", linejoin = "round") +
+  scale_alpha_continuous(limits = c(0, 1), range = c(1, 1), guide = FALSE) +
+  geom_point(aes(fill = in_silico_clusters, size = Size), shape = 21, colour="white") +
+  scale_fill_manual(values = pal.cl) +
+  scale_size(range = c(5, 10), guide = FALSE) +
+  theme_void()  #+ scale_y_reverse() + coord_flip() 
+
+ggsave(filename = file.path(fig.dir, "6_paga/PAGA_clusters.png"), device = "png", width = 5, height = 5, dpi = 300)
+
+
+
+ggplot(clust_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = clust_edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, alpha = 0.5), size = (clust_edges$Connectivity)*10) +
+  geom_point(aes(fill = in_silico_clusters, size = Size), shape = 21, colour="white") +
+  #geom_segment(data = clust_edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, alpha = Connectivity),
+  #             size = (clust_edges$Connectivity)*10) +
+  #scale_alpha_continuous(limits = c(0, 1), range = c(0.7, 0.7), guide = FALSE) +
+  #geom_point(aes(fill = in_silico_clusters, size = Size), shape = 21, colour="white") +
+  scale_fill_manual(values = pal.cl) +
+  scale_size(range = c(6, 12), guide = FALSE) +
+  theme_void() + theme(legend.position = "none")  #+ scale_y_reverse() + coord_flip() 
+
+ggsave(filename = file.path(fig.dir, "6_paga/PAGA_clusters_nolegend.png"), device = "png", width = 4, height = 4, dpi = 300)
+
+```
+
+FA
+```{r}
+ggplot(cell_embedding, aes(x = X, y = Y)) +
+    geom_segment(data = cell_edges,
+                 aes(x = FromX, y = FromY, xend = ToX, yend = ToY,
+                     size = Connectivity, alpha = Connectivity), colour="grey50") +
+    geom_point(aes(colour = in_silico_clusters), size = 0.8) +
+    scale_colour_manual(values = pal.cl) +
+    scale_alpha_continuous(limits = c(0, 1), range = c(0.05, 0.5), guide = FALSE) +
+    scale_size(range = c(0.1, 0.5), guide = FALSE) +
+    theme_void() # + scale_y_reverse() + coord_flip() 
+
+ggsave(filename = file.path(fig.dir, "6_paga/PAGA_cells.png"), device = "png", width = 5, height = 5, dpi = 300)
+
+ggplot(cell_embedding, aes(x = X, y = Y)) +
+    geom_segment(data = cell_edges,
+                 aes(x = FromX, y = FromY, xend = ToX, yend = ToY,
+                     size = Connectivity, alpha = Connectivity), colour="grey50") +
+    geom_point(aes(colour = in_silico_clusters), size = 0.8) +
+    scale_colour_manual(values = pal.cl) +
+    scale_alpha_continuous(limits = c(0, 1), range = c(0.05, 0.5), guide = FALSE) +
+    scale_size(range = c(0.1, 0.5), guide = FALSE) +
+    theme_void() + theme(legend.position = "none")  #+ scale_y_reverse() + coord_flip() 
+
+ggsave(filename = file.path(fig.dir, "6_paga/PAGA_cells_nolegend.png"), device = "png", width = 5, height = 5, dpi = 300)
+
+ggplot(cell_embedding, aes(x = X, y = Y)) +
+    geom_point(aes(colour = in_silico_clusters), size = 0.8) +
+    scale_colour_manual(values = pal.cl) +
+    theme_void() + theme(legend.position = "none")   #+ scale_y_reverse() + coord_flip() 
+
+ggsave(filename = file.path(fig.dir, "6_paga/PAGA_cells_noconnections.png"), device = "png", width = 5, height = 5, dpi = 300)
+```
+
+### FA in Seurat
+
+Clusters
+```{r}
+DimPlot(object = seu, reduction = "FA", group.by = "in_silico_clusters", label=TRUE, label.size = 5, cols = pal.cl, pt.size = 0.8)
+ggsave(filename = file.path(fig.dir, "6_paga/FA_clusters.png"), device = "png", width = 6, height = 6, dpi = 300)
+DimPlot(object = seu, reduction = "FA", group.by = "in_silico_clusters", cols = pal.cl, pt.size = 1) + NoLegend() + NoAxes()
+ggsave(filename = file.path(fig.dir, "6_paga/FA_clusters_nolegend.png"), device = "png", width = 5, height = 5, dpi = 300)
+```
+
+Days
+```{r}
+DimPlot(object = seu, reduction = "FA", group.by = "sample", label=TRUE, label.size = 5, cols = pal.sa.vi, pt.size = 0.8)
+ggsave(filename = file.path(fig.dir, "6_paga/FA_days.png"), device = "png", width = 6, height = 6, dpi = 300)
+DimPlot(object = seu, reduction = "FA", group.by = "sample", cols = pal.sa.vi, pt.size = 0.8) + NoLegend() + NoAxes()
+ggsave(filename = file.path(fig.dir, "6_paga/FA_days_nolegend.png"), device = "png", width = 5, height = 5, dpi = 300)
+```
+
+Pseudotime
+```{r}
+FeaturePlot(seu, reduction = "FA", features = "dpt_pseudotime", pt.size = 0.8) + scale_colour_viridis(option = "viridis")
+ggsave(filename = file.path(fig.dir, "6_paga/FA_pseudotime.png"), device = "png", width = 6, height = 6, dpi = 300)
+
+FeaturePlot(seu, reduction = "FA", features = "dpt_pseudotime", pt.size = 0.8) + scale_colour_viridis(option = "viridis") + NoLegend() + NoAxes() + ggtitle(label=NULL)
+ggsave(filename = file.path(fig.dir, "6_paga/FA_pseudotime_nolegend.png"), device = "png", width = 5, height = 5, dpi = 300)
+```
+
+bac a sable
+```{r}
+FeaturePlot(seu, reduction = "FA", "Sox9", pt.size = 1) + scale_colour_viridis(option="plasma")
+FeaturePlot(seu, reduction = "FA", "Wnt5a", pt.size = 1) + scale_colour_viridis(option="plasma")
+FeaturePlot(seu, reduction = "FA", "Sfrp1", pt.size = 1) + scale_colour_viridis(option="plasma")
+FeaturePlot(seu, reduction = "FA", "Fgfr2", pt.size = 1) + scale_colour_viridis(option="plasma")
+FeaturePlot(seu, reduction = "FA", "Hoxb13", pt.size = 1) + scale_colour_viridis(option="plasma")
+```
+
+--------------------------------------------------------------------------------
+## Session Information
+```{r}
+sessionInfo()
+```

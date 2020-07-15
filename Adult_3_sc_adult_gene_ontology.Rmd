@@ -1,0 +1,638 @@
+---
+title: "Adult scRNAseq datasets analysis"
+subtitle: "Gene Onotology"
+author: "Renaud Mevel"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, cache.lazy = TRUE)
+```
+
+## Objective
+
+Perform gene ontology analysis.
+  
+Directories need to be adapted throughout the scripts.
+  
+## Prepare the environment
+
+```{r , warning=FALSE, message=FALSE}
+# Data wrangling
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(data.table)
+
+# Plots
+library(gridExtra)
+library(ggpubr)
+
+# sc
+library(Seurat)
+library(sctransform)
+library(MAST)
+library(org.Mm.eg.db)
+library(DoubletFinder)
+
+# GO
+library(gprofiler2)
+
+# Palettes
+library(pals)
+pal25 <- as.character(pals::cols25(n=25))
+pal.trt <- c("#a1e186", "#b9006e")
+pal.rfp <- c("#ea4749", "#479bea")
+pal.runs <- c("#ec0016", "#ffc554", "#20a4ff")
+pal.lobe = c("#272873", "#45A5A7", "#cb5155")
+pal.pop <- 
+  c( 
+    "#7a0177", "#dd3497",    # cas AP
+    "#f768a1", "#fa9fb5",    # cas DLP
+    "#fc9272", "#cb181d",    # cas
+    "#CC6677", "#AA4466",    # cas VP
+    "#081d58", "#225ea8",    # hn AP
+    "#7fcdbb", "#7fb8cd",    # hn DLP
+    "#67a9cf", "#b2d3e7"     # hn VP
+    )
+pal.cl <- c(
+  "#B2B8E0", #LumA
+  "#4A6FE3", #LumB
+  "#1037AA", #LumC
+  "#D33F6A", #LumD
+  "#EF9708", #LumE
+  "#F0B98D", #LumF
+  "#8DD593"  #Basal
+  )
+
+# Directories
+setwd(dir = "~/set-directory/")
+pdf.dir <- "~/set-directory/"
+fig.dir <- "~/set-directory/"
+
+# Functions
+source("Adult_functions.R")
+
+# Seed
+set.seed(1)
+```
+
+## Load data
+
+```{r}
+sce <- readRDS(file.path("r_save/sce.sc.umap.rds"))
+```
+
+## FindMarkers
+
+### Epithelial clusters
+
+Load if exists already
+```{r, eval=FALSE}
+epi.markers <- readRDS(file.path("r_save/epi.markers.rds"))
+```
+
+Use **MAST** algorithm otherwise.
+```{r, eval=FALSE}
+epi.markers <- FindAllMarkers(
+  sce, 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = FALSE)
+
+saveRDS(epi.markers, file = file.path("r_save/epi.markers.rds"))
+```
+
+```{r, eval=FALSE}
+# Top positive markers
+top5.epi <- 
+  epi.markers %>% 
+  group_by(cluster) %>% 
+  filter(avg_logFC>0) %>% 
+  top_n(n=5, wt=avg_logFC)
+
+top10.epi <- 
+  epi.markers %>% 
+  group_by(cluster) %>% 
+  filter(avg_logFC>0) %>% 
+  top_n(n=10, wt=avg_logFC)
+```
+
+### ABC vs D
+
+```{r}
+D_vs_ABC <- FindMarkers(
+  sce,
+  ident.1 = c("Lum-D"),
+  ident.2 = c("Lum-A", "Lum-B", "Lum-C"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = FALSE)
+
+write.table(x = D_vs_ABC, file = paste0("r_export/", "D_vs_ABC.txt"), 
+            sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+#### EF vs D
+
+```{r}
+D_vs_EF <- FindMarkers(
+  sce,
+  ident.1 = c("Lum-D"),
+  ident.2 = c("Lum-E", "Lum-F"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = FALSE)
+
+write.table(x = D_vs_ABC, file = paste0("r_export/", "D_vs_EF.txt"), 
+            sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+## Number of DEG
+
+Upregulated only
+```{r}
+stat <- epi.markers %>%
+    group_by(cluster) %>%
+    summarise(count = n())
+
+ggplot(stat, aes(x = fct_rev(cluster), y = count, fill = cluster)) +
+    geom_col() +
+    geom_text(aes(y = count + sign(count) * max(abs(count)) * 0.07, label = abs(count)), size = 6, colour = "grey25") +
+    coord_flip() +
+    scale_fill_manual(values = pal.cl) +
+    ggtitle("Number of DE genes identified per cluster") +
+    theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text.x = element_blank(),
+          legend.position = "bottom")
+```
+
+```{r}
+plot_data <- epi.markers %>%
+    mutate(IsUp = avg_logFC > 0) %>%
+    group_by(cluster) %>%
+    summarise(Up = sum(IsUp), Down = sum(!IsUp)) %>%
+    mutate(Down = -Down) %>%
+    gather(key = "Direction", value = "Count", -cluster) %>%
+    mutate(Cluster = factor(cluster))
+
+ggplot(plot_data, aes(x = fct_rev(cluster), y = Count, fill = Direction)) +
+    geom_col() +
+    geom_text(aes(y = Count + sign(Count) * max(abs(Count)) * 0.07,
+                  label = abs(Count)),
+              size = 6, colour = "grey25") +
+    coord_flip() +
+    scale_fill_manual(values = c("#377eb8", "#e41a1c")) +
+    ggtitle("Number of identified genes") +
+    theme_minimal() +
+    theme(axis.title = element_blank(),
+          axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text.x = element_blank(),
+          legend.position = "bottom")
+```
+
+
+## GO: Gene Ontology
+
+### Individual clusters (up)
+
+Lum-A
+```{r}
+go <- gost(query = epi.markers %>% filter(cluster == "Lum-A" & avg_logFC > 0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.LA <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "Lum-A")
+
+#plot
+g.LA <- ggplot(go.LA %>% top_n(n=-8, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value), label = term_id, hjust=0)) +
+  #scale_fill_viridis_c(alpha = 1, begin = 0.5, end = 1, option = "magma") +
+  scale_fill_manual(values = c(rep(pal.cl[1],8))) +
+  scale_y_continuous(limits=c(0,20)) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  theme(
+    axis.title.y=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.LA
+ggsave(g.LA, filename = file.path(fig.dir, "5_go_terms/GO_Lum_A.png"), device = "png", width = 6, height = 2.5, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.LA+t, filename = file.path(fig.dir, "5_go_terms/GO_Lum_A_nolegend.png"), device = "png", width = 4, height = 2.5, dpi = 300)
+```
+
+Lum-B
+```{r}
+go <- gost(query = epi.markers %>% filter(cluster == "Lum-B" & avg_logFC > 0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.LB <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "Lum-B")
+
+#plot
+g.LB <- ggplot(go.LB %>% top_n(n=-8, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=1.0)) +
+  scale_fill_manual(values = c(rep(pal.cl[2],8))) +
+  scale_y_continuous(limits=c(0,20)) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  theme(
+    axis.title.y=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.LB
+ggsave(g.LB, filename = file.path(fig.dir, "5_go_terms/GO_Lum_B.png"), device = "png", width = 6, height = 2.5, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.LB+t, filename = file.path(fig.dir, "5_go_terms/GO_Lum_B_nolegend.png"), device = "png", width = 4, height = 2.5, dpi = 300)
+```
+
+Lum-C
+```{r}
+go <- gost(query = epi.markers %>% filter(cluster == "Lum-C" & avg_logFC > 0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.LC <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "Lum-C")
+
+#plot
+g.LC <- ggplot(go.LC %>% top_n(n=-8, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=0)) +
+  scale_fill_manual(values = c(rep(pal.cl[3],8))) +
+  scale_y_continuous(limits=c(0,20)) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  theme(
+    axis.title.y=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.LC
+ggsave(g.LC, filename = file.path(fig.dir, "5_go_terms/GO_Lum_C.png"), device = "png", width = 6, height = 2.5, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.LC+t, filename = file.path(fig.dir, "5_go_terms/GO_Lum_C_nolegend.png"), device = "png", width = 4, height = 2.5, dpi = 300)
+```
+
+Lum-D
+```{r}
+go <- gost(query = epi.markers %>% filter(cluster == "Lum-D" & avg_logFC > 0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.LD <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "Lum-D")
+
+#plot
+g.LD <- ggplot(go.LD %>% top_n(n=-8, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=0)) +
+  scale_fill_manual(values = c(rep(pal.cl[4],8))) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  scale_y_continuous(limits=c(0,20)) +
+  theme(
+    axis.title.y=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.LD
+ggsave(g.LD, filename = file.path(fig.dir, "5_go_terms/GO_Lum_D.png"), device = "png", width = 6, height = 2.5, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.LD+t, filename = file.path(fig.dir, "5_go_terms/GO_Lum_D_nolegend.png"), device = "png", width = 4, height = 2.5, dpi = 300)
+```
+
+Lum-E
+```{r}
+go <- gost(query = epi.markers %>% filter(cluster == "Lum-E" & avg_logFC > 0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.LE <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "Lum-E")
+
+#plot
+g.LE <- ggplot(go.LE %>% top_n(n=-8, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=0)) +
+  scale_fill_manual(values = c(rep(pal.cl[5],8))) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  scale_y_continuous(limits=c(0,20)) +
+  theme(
+    axis.title.y=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.LE
+ggsave(g.LE, filename = file.path(fig.dir, "5_go_terms/GO_Lum_E.png"), device = "png", width = 6, height = 2.5, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.LE+t, filename = file.path(fig.dir, "5_go_terms/GO_Lum_E_nolegend.png"), device = "png", width = 4, height = 2.5, dpi = 300)
+```
+
+Lum-F
+```{r}
+go <- gost(query = epi.markers %>% filter(cluster == "Lum-F" & avg_logFC > 0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.LF <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "Lum-F")
+
+#plot
+g.LF <- ggplot(go.LF %>% top_n(n=-8, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=0)) +
+  scale_fill_manual(values = c(rep(pal.cl[6],8))) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  scale_y_continuous(limits=c(0,20)) +
+  theme(
+    axis.title.y=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.LF
+ggsave(g.LF, filename = file.path(fig.dir, "5_go_terms/GO_Lum_F.png"), device = "png", width = 6, height = 2.5, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.LF+t, filename = file.path(fig.dir, "5_go_terms/GO_Lum_F_nolegend.png"), device = "png", width = 4, height = 0.7, dpi = 300)
+```
+
+Basal
+```{r}
+go <- gost(query = epi.markers %>% filter(cluster == "Bas" & avg_logFC > 0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.Bas <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "Bas")
+
+#plot
+g.Bas <- ggplot(go.Bas %>% top_n(n=-8, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=1)) +
+  scale_fill_manual(values = c(rep(pal.cl[7],8))) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  scale_y_continuous(limits=c(0,22)) +
+  theme(
+    axis.title.y=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.Bas
+ggsave(g.Bas, filename = file.path(fig.dir, "5_go_terms/GO_Bas.png"), device = "png", width = 6, height = 2.5, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.Bas+t, filename = file.path(fig.dir, "5_go_terms/GO_Bas_nolegend.png"), device = "png", width = 4, height = 2.5, dpi = 300)
+```
+
+### Cluster groups
+
+#### D vs ABC
+
+D vs ABC - Upregulated
+```{r}
+go <- gost(query = D_vs_ABC %>% tibble::rownames_to_column(var="gene") %>% filter(avg_logFC > 0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.D_vs_ABC_up <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "D_vs_ABC_up")
+
+#plot
+g.D_vs_ABC <- ggplot(go.D_vs_ABC_up %>% top_n(n=-15, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=1)) +
+  scale_fill_manual(values = c(rep("#E67DA2",15))) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  scale_y_continuous(limits=c(0,20)) +
+  theme(
+    axis.title.y=element_blank(),
+    axis.title.x=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.D_vs_ABC
+ggsave(g.D_vs_ABC, filename = file.path(fig.dir, "5_go_terms/GO_D_vs_ABC_up.png"), device = "png", width = 6, height = 4, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.D_vs_ABC+t, filename = file.path(fig.dir, "5_go_terms/GO_D_vs_ABC_up_nolegend.png"), device = "png", width = 4, height = 4, dpi = 300)
+```
+
+D vs ABC - Downregulated
+```{r}
+go <- gost(query = D_vs_ABC %>% tibble::rownames_to_column(var="gene") %>% filter(avg_logFC < -0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.D_vs_ABC_down <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "D_vs_ABC_down")
+
+#plot
+g.D_vs_ABC <- ggplot(go.D_vs_ABC_down %>% top_n(n=-15, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=0)) +
+  scale_fill_manual(values = c(rep("#77D9DE",15))) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  scale_y_continuous(limits=c(0,20)) +
+  theme(
+    axis.title.y=element_blank(),
+    axis.title.x=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.D_vs_ABC
+ggsave(g.D_vs_ABC, filename = file.path(fig.dir, "5_go_terms/GO_D_vs_ABC_down.png"), device = "png", width = 6, height = 4, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.D_vs_ABC+t, filename = file.path(fig.dir, "5_go_terms/GO_D_vs_ABC_down_nolegend.png"), device = "png", width = 4, height = 4, dpi = 300)
+```
+
+#### D vs EF
+
+D vs EF - Upregulated
+```{r}
+go <- gost(query = D_vs_EF %>% tibble::rownames_to_column(var="gene") %>% filter(avg_logFC > 0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.D_vs_EF_up <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "D_vs_EF_up")
+
+#plot
+g.D_vs_EF <- ggplot(go.D_vs_EF_up %>% top_n(n=-15, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=term_name)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=0)) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  scale_fill_manual(values = c(rep("#E67DA2",15))) +
+  scale_y_continuous(limits=c(0,10)) +
+  theme(
+    axis.title.y=element_blank(),
+    axis.title.x=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.D_vs_EF
+ggsave(g.D_vs_EF, filename = file.path(fig.dir, "5_go_terms/GO_D_vs_EF_up.png"), device = "png", width = 6, height = 4, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.D_vs_EF+t, filename = file.path(fig.dir, "5_go_terms/GO_D_vs_EF_up_nolegend.png"), device = "png", width = 4, height = 4, dpi = 300)
+```
+
+D vs EF - Downregulated
+```{r}
+go <- gost(query = D_vs_EF %>% tibble::rownames_to_column(var="gene") %>% filter(avg_logFC < -0.5) %>% pull(gene), 
+           organism = "mmusculus",
+           significant = TRUE)
+
+gostplot(go, capped = FALSE, interactive = TRUE)
+
+go.D_vs_EF_down <- go$result %>% 
+  filter(source == "GO:BP") %>% 
+  dplyr::select(p_value, term_id, source, term_name, parents) %>% 
+  arrange(p_value) %>% 
+  dplyr::mutate(Cluster = "D_vs_EF_down")
+
+#plot
+g.D_vs_EF <- ggplot(go.D_vs_EF_down %>% top_n(n=-15, wt=p_value), aes(x=reorder(term_name, -p_value) , y=-log10(p_value), fill=-log10(p_value))) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(aes(y=-log10(p_value) ,label = term_id, hjust=0)) +
+  scale_fill_manual(values = c(rep("#77D9DE",15))) +
+  geom_hline(yintercept = -log10(0.05), color="grey30", linetype="dashed") +
+  scale_y_continuous(limits=c(0,10)) +
+  theme(
+    axis.title.y=element_blank(),
+    axis.title.x=element_blank(),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white")
+  ) + rotate()
+g.D_vs_EF
+ggsave(g.D_vs_EF, filename = file.path(fig.dir, "5_go_terms/GO_D_vs_EF_down.png"), device = "png", width = 6, height = 4, dpi = 300)
+
+t <- theme(axis.title.x=element_blank(), axis.text.y=element_blank())
+ggsave(g.D_vs_EF+t, filename = file.path(fig.dir, "5_go_terms/GO_D_vs_EF_down_nolegend.png"), device = "png", width = 4, height = 4, dpi = 300)
+```
+
+## Session Information
+```{r}
+sessionInfo()
+```

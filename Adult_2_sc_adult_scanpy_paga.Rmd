@@ -1,0 +1,543 @@
+---
+title: "Adult scRNAseq datasets analysis"
+subtitle: "Scanpy PAGA"
+author: "Renaud Mevel"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, cache.lazy = TRUE)
+```
+
+## Objective
+
+Import data generated in Scanpy/PAGA and plot in R.
+  
+Directories need to be adapted throughout the scripts.
+  
+## Prepare the environment
+
+```{r , warning=FALSE, message=FALSE}
+# Data wrangling
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(data.table)
+
+# Plots
+library(gridExtra)
+library(ggpubr)
+library(viridis) 
+
+# sc
+library(Seurat)
+library(sctransform)
+library(MAST)
+library(org.Mm.eg.db)
+library(DoubletFinder)
+
+# GO
+library(gprofiler2)
+
+# Palettes
+library(pals)
+pal25 <- as.character(pals::cols25(n=25))
+pal.trt <- c("#a1e186", "#b9006e")
+pal.rfp <- c("#ea4749", "#479bea")
+pal.runs <- c("#ec0016", "#ffc554", "#20a4ff")
+pal.lobe = c("#272873", "#45A5A7", "#cb5155")
+pal.pop <- 
+  c( 
+    "#7a0177", "#dd3497",    # cas AP
+    "#f768a1", "#fa9fb5",    # cas DLP
+    "#fc9272", "#cb181d",    # cas
+    "#CC6677", "#AA4466",    # cas VP
+    "#081d58", "#225ea8",    # hn AP
+    "#7fcdbb", "#7fb8cd",    # hn DLP
+    "#67a9cf", "#b2d3e7"     # hn VP
+    )
+
+pal.cl <- c(
+  "#B2B8E0", #LumA
+  "#4A6FE3", #LumB
+  "#1037AA", #LumC
+  "#D33F6A", #LumD
+  "#EF9708", #LumE
+  "#F0B98D", #LumF
+  "#8DD593"  #Basal
+  )
+
+
+# Directories
+setwd(dir = "~/set-directory/")
+pdf.dir <- "~/set-directory/"
+fig.dir <- "~/set-directory/"
+
+# Functions
+source("Adult_functions.R")
+
+# Seed
+set.seed(1)
+```
+
+## Functions 1
+
+```{r}
+plotPAGAClustGraph <- function(embedding, edges, thresh = 0, colour = "in_silico_clusters") {
+
+    is_discrete <- is.factor(embedding[[colour]])
+
+    gg <- ggplot(embedding, aes(x = X, y = Y))
+
+    if (is_discrete) {
+        gg <- gg +
+            geom_segment(data = filter(edges, Connectivity > thresh),
+                         aes(x = FromX, y = FromY, xend = ToX, yend = ToY, #alpha = Connectivity
+                             colour = Connectivity), size = (edges$Connectivity)*10 ) +
+            scale_colour_viridis_c(direction = 1, begin = 0.2, end = 0.6, option="inferno")
+    } else {
+        gg <- gg +
+            geom_segment(data = filter(edges, Connectivity > thresh),
+                         aes(x = FromX, y = FromY, xend = ToX, yend = ToY,
+                             alpha = Connectivity), colour = "grey30") +
+            scale_alpha(limits = c(0, 1)) +
+            scale_fill_viridis_c()
+    }
+
+    gg <- gg +
+        geom_point(aes(fill = !!ensym(colour), size = Size), shape = 21) +
+        scale_fill_manual(values = pal.cl) +
+        geom_text(aes(label = in_silico_clusters)) +
+        scale_size(range = c(5, 20)) +
+        theme_void() +
+        theme(legend.position = "none")
+
+    return(gg)
+}
+
+
+###  -----------------------------------------
+
+plotPAGACellGraph <- function(embedding, edges, thresh = 0, colour = "in_silico_clusters", label = FALSE) {
+
+    is_discrete <- is.factor(embedding[[colour]])
+
+    gg <- ggplot(embedding, aes(x = X, y = Y, colour = !!ensym(colour))) +
+        geom_segment(data = filter(edges, Connectivity > thresh),
+                     aes(x = FromX, y = FromY, xend = ToX, yend = ToY),
+                     size = 0.1, colour = "grey50") +
+        geom_point(size = 0.5, aes(colour = in_silico_clusters)) +
+        scale_colour_manual(values = pal.cl) +
+        theme_void() +
+        theme(legend.position = "none")
+
+    if (!is_discrete) {
+        gg <- gg + scale_color_viridis_c()
+    }
+
+    if (label) {
+        clust_data <- embedding %>%
+            group_by(in_silico_clusters) %>%
+            summarise(X = mean(X),
+                      Y = mean(Y))
+
+        gg <- gg +
+          #geom_point(data = clust_data, aes(fill = in_silico_clusters),
+          #             size = 10, shape = 21, colour = "white") +
+          scale_fill_manual(values = pal.cl) +
+          geom_text(data = clust_data, aes(label = in_silico_clusters),
+                      colour = "black")
+    }
+
+    return(gg)
+}
+
+###  -----------------------------------------
+
+plotPAGACompare <- function(clust_embedding, clust_edges, clust_thresh = 0,
+                            cell_embedding, cell_edges, cell_thresh = 0,
+                            colour = NA, label = FALSE) {
+
+    clusts <- plotPAGAClustGraph(clust_embedding, clust_edges, clust_thresh,
+                                 colour)
+
+    cells <- plotPAGACellGraph(cell_embedding, cell_edges, cell_thresh,
+                               colour, label)
+
+    cowplot::plot_grid(clusts, cells, nrow = 1)
+}
+```
+
+
+## Functions 2 
+
+Function to plot genes in PAGA and FA
+```{r}
+
+##### In PAGA space ---------------------------------------------------------
+plotPAGAgene <- function(scdata, cl.embedding, cl.edges, sc.embedding, gene = "Runx1", legend=TRUE, thresh=0, show.clusters=FALSE, rm.cl = NA) {
+  
+  # remove cluster if asked
+  if (!is.na(rm.cl)) { 
+    cl.embedding <- dplyr::filter(cl.embedding, in_silico_clusters != rm.cl)
+    cl.edges <- dplyr::filter(cl.edges, From != rm.cl, To != rm.cl)
+    }
+  
+  sc.embedding[[gene]] <- logcounts(scdata)[gene, ]
+  
+  paga_gene <- sc.embedding %>%
+    dplyr::select(-Cell, -X, -Y) %>%
+    group_by(in_silico_clusters) %>%
+    summarise_all(mean)
+  
+  paga_gene[, gene][paga_gene[, gene] == 0] <- NA 
+  
+  max.scale = max(paga_gene[[gene]])
+  min.scale = min(paga_gene[[gene]], na.rm = TRUE)
+  
+  paga_embedding <- left_join(cl.embedding, paga_gene, by = "in_silico_clusters")
+  
+  cl.edges <- cl.edges %>% mutate(Connectivity = ifelse(Connectivity < thresh, NA, Connectivity))
+  
+  g <- ggplot(paga_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = cl.edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY), size = (cl.edges$Connectivity)*10, alpha=0.5) +
+  geom_point(aes(fill = !!ensym(gene), size = Size), shape = 21, colour="grey30") +
+  scale_fill_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 0.9, limits = c(0, max.scale)) +
+  scale_size(range = c(6, 12), guide = FALSE) +
+  theme_void()
+  
+  if (legend==FALSE) { g <- g + theme(legend.position = "none") }
+  if (show.clusters==TRUE) { g <- g + geom_text(aes(label = in_silico_clusters)) }
+  g
+}
+
+##### In ForceAtlas space ---------------------------------------------------------
+
+plotFAgene <- function(scdata, cell.embedding, cell.edges, gene, legend=TRUE, pt.size=0.8, show.connections=TRUE, thresh=0) {
+  
+  cell.embedding[[gene]] <- logcounts(scdata)[gene, ]
+  
+  cell.embedding[, 5][cell.embedding[, 5] == 0] <- NA # replace 0 with NA
+  
+  max.scale = max(cell.embedding[[gene]])
+  min.scale = min(cell.embedding[[gene]], na.rm = TRUE)
+  
+  cell.edges <- cell.edges %>% mutate(Connectivity = ifelse(Connectivity < thresh, NA, Connectivity))
+  
+  g <- ggplot(cell.embedding, aes(x = X, y = Y))
+  
+    if (show.connections==TRUE) { 
+  g <- g + geom_segment(data = cell.edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, size = Connectivity, alpha = Connectivity), colour="grey50")
+  g <- g + scale_alpha_continuous(limits = c(0, 1), range = c(0.2, 1), guide = FALSE)
+  g <- g + scale_size(range = c(0.1, 0.5), guide = FALSE)
+  }
+  
+  g <- g + geom_point(aes(colour = !!ensym(gene)), size=pt.size)
+  g <- g + scale_colour_viridis_c(option = "plasma", na.value = "grey80", end = 1, limits = c(min.scale, max.scale))
+  g <- g + theme_void()
+
+  if (legend==FALSE) { g <- g + theme(legend.position = "none") }
+  
+  g
+}
+```
+
+## Load data
+
+```{r}
+seu <- readRDS(file.path("r_save/sce.sc.umap.rds"))
+sce <- as.SingleCellExperiment(seu, assay = "RNA")
+```
+
+## Load PAGA
+
+```{r}
+# cluster embeddings--------------------------------------------------------------------------
+clust_embedding <- read_csv("/sc_adult_dataset/paga_all_epithelial/output_umap/paga/cluster_embedding.csv",
+                            col_types = cols(.default = col_double()))  %>%
+  mutate(Size = as.numeric(table(colData(sce)$in_silico_clusters))) %>%
+  dplyr::rename(Cluster = in_silico_clusters) %>% 
+  mutate(Cluster = factor(Cluster)) %>% 
+  mutate(in_silico_clusters = factor(names(table(colData(sce)$in_silico_clusters)), levels = levels(colData(sce)$in_silico_clusters)))
+
+# cluster edges--------------------------------------------------------------------------------
+clust_edges <- read_csv("/sc_adult_dataset/paga_all_epithelial/output_umap/paga/cluster_edges.csv",
+                        col_types = cols(.default = col_double()))  %>%
+  mutate(To = factor(To, levels = levels(clust_embedding$Cluster)),
+         From = factor(From, levels = levels(clust_embedding$Cluster))) %>%
+    left_join(clust_embedding, by = c("From" = "Cluster")) %>%
+    dplyr::rename(FromX = X, 
+                  FromY = Y,
+                  From_in_silico_clusters = in_silico_clusters) %>%  
+    dplyr::select(-Size) %>%
+    left_join(clust_embedding, by = c("To" = "Cluster")) %>%
+    dplyr::rename(ToX = X, 
+                  ToY = Y, 
+                  To_in_silico_clusters = in_silico_clusters) %>%
+    dplyr::select(-Size)
+
+# remove 'Cluster'----------------------------------------------------------------------------
+clust_embedding <- dplyr::select(clust_embedding, -Cluster)
+clust_edges <- clust_edges %>% 
+  dplyr::mutate(From = From_in_silico_clusters,
+                To = To_in_silico_clusters) %>% 
+  dplyr::select(-From_in_silico_clusters, -To_in_silico_clusters)
+
+# cell embeddings----------------------------------------------------------------------------
+cell_embedding <- read_csv("/sc_adult_dataset/paga_all_epithelial/output_umap/paga/cell_embedding.csv",
+                           col_types = cols(.default = col_double(), Cell = col_character())
+                           ) %>%
+  mutate(in_silico_clusters = colData(sce)$in_silico_clusters)
+
+# cell edges ---------------------------------------------------------------------------------
+cell_edges <- read_csv("/sc_adult_dataset/paga_all_epithelial/output_umap/paga/cell_edges.csv",
+                        col_types = cols(.default = col_double(), From = col_character(), To = col_character())
+                       )  %>%
+  dplyr::left_join(cell_embedding, by = c("From" = "Cell")) %>%
+  dplyr::rename(FromX = X, FromY = Y) %>%
+  dplyr::select(-in_silico_clusters) %>%
+  dplyr::left_join(cell_embedding, by = c("To" = "Cell")) %>%
+  dplyr::rename(ToX = X, ToY = Y) %>%
+  dplyr::select(-in_silico_clusters)
+```
+
+## Visualise PAGA
+
+
+### Cluster graph
+
+```{r}
+plotPAGAClustGraph(clust_embedding, clust_edges, thresh = 0.0)
+```
+
+
+### Edges threshold
+
+Number of selected edges for different threshold connectivities.
+```{r}
+plot_data <- tibble(
+    Threshold = seq(0, 1, 0.01)
+) %>%
+    mutate(Edges = map_int(Threshold, function(thresh) {
+        sum(clust_edges$Connectivity > thresh)
+    }))
+
+con_thresh <- 0.7
+
+ggplot(plot_data, aes(x = Threshold, y = Edges)) +
+    geom_point() +
+    geom_line() +
+    geom_vline(xintercept = con_thresh, colour = "red") +
+    xlab("Connectivity threshold") +
+    ylab("Number of edges") +
+    theme_minimal()
+```
+
+### Cell graph
+
+```{r}
+plotPAGACellGraph(cell_embedding, cell_edges, thresh = 0.03)
+```
+
+### Compare
+
+```{r}
+plotPAGACompare(clust_embedding, clust_edges, clust_thresh = 0,
+                cell_embedding, cell_edges, cell_thresh = 0)
+```
+
+### Genes
+
+```{r}
+known_genes <- c(
+    # Luminal
+    "Spink1", "Msmb", "Pbsn", "Psca",
+    # Basal
+    "Krt5", "Krt14", "Trp63", "Apoe",
+    # Of interest
+    "Runx1", "Nkx3-1", "Tacstd2",
+    # Regressed
+    "Lpl", "Basp1", "Car2", "Crym"
+)
+
+for (gene in known_genes) {
+    cell_embedding[[gene]] <- logcounts(sce)[gene, ]
+}
+
+clust_genes <- cell_embedding %>%
+    dplyr::select(-Cell, -X, -Y) %>%
+    group_by(in_silico_clusters) %>%
+    summarise_all(mean)
+
+clust_embedding <- left_join(clust_embedding, clust_genes, by = "in_silico_clusters")
+```
+
+```{r}
+plotPAGACompare(clust_embedding, clust_edges, clust_thresh = 0, 
+                cell_embedding, cell_edges, cell_thresh = 0, 
+                colour = 'Runx1')
+```
+
+
+### Gene expression
+
+Bac a sable
+In PAGA
+```{r}
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Nkx3-1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Runx1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Tacstd2")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Mki67")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Psca")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt4")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Nupr1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Meis2")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Shh")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Ar")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Foxa1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Etv1")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Etv4")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Gata2")
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Trp63")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Apoe")
+
+(
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt5") /
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt14") /
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt7") /
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt19") 
+) | (
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt8")/
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt18")/
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt17")/
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt4")
+)
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Gsto1")
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Cd24a")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Itga6")
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Dpp4")
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Krt20")
+
+plotPAGAgene(sce, clust_embedding, clust_edges, cell_embedding, gene = "Sox2")
+```
+
+In ForceAtlas
+```{r}
+plotFAgene(sce, cell_embedding, cell_edges, gene = "Runx1", pt.size = 1, thresh=0, show.connections = TRUE, legend=FALSE)
+plotFAgene(sce, cell_embedding, cell_edges, gene = "Nkx3-1", pt.size = 1, thresh=0, show.connections = TRUE, legend=FALSE)
+plotFAgene(sce, cell_embedding, cell_edges, gene = "Shh", pt.size = 1, thresh=0, show.connections = TRUE)
+```
+
+### Figures
+
+Coloured connections
+```{r}
+ggplot(clust_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = clust_edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, colour = Connectivity, alpha = Connectivity), 
+               size = (clust_edges$Connectivity)*8) +
+  scale_colour_viridis_c(direction = 1, begin = 0.2, end = 0.6, option="inferno") +
+  scale_alpha_continuous(limits = c(0, 1), range = c(0.7, 0.9), guide = FALSE) +
+  geom_point(aes(fill = in_silico_clusters, size = Size), shape = 21, colour="white") +
+  scale_fill_manual(values = pal.cl) +
+  scale_size(range = c(5, 10), guide = FALSE) +
+  theme_void()
+
+#ggsave(filename = file.path(fig.dir, "4_paga/PAGA_clusters_c.png"), device = "png", width = 7, height = 4, dpi = 300)
+
+
+ggplot(clust_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = clust_edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, colour = Connectivity, alpha = Connectivity), 
+               size = (clust_edges$Connectivity)*8) +
+  scale_colour_viridis_c(direction = 1, begin = 0.2, end = 0.6, option="inferno") +
+  scale_alpha_continuous(limits = c(0, 1), range = c(0.7, 0.9), guide = FALSE) +
+  geom_point(aes(fill = in_silico_clusters, size = Size), shape = 21, colour="white") +
+  scale_fill_manual(values = pal.cl) +
+  scale_size(range = c(5, 10), guide = FALSE) +
+  theme_void() + theme(legend.position = "none")
+
+#ggsave(filename = file.path(fig.dir, "4_paga/PAGA_clusters_c_nolegend.png"), device = "png", width = 6, height = 4, dpi = 300)
+
+```
+
+Black connections
+```{r}
+ggplot(clust_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = clust_edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, alpha = Connectivity),
+               size = (clust_edges$Connectivity)*8) +
+  scale_alpha_continuous(limits = c(0, 1), range = c(0.7, 0.9), guide = FALSE) +
+  geom_point(aes(fill = in_silico_clusters, size = Size), shape = 21, colour="white") +
+  scale_fill_manual(values = pal.cl) +
+  scale_size(range = c(5, 10), guide = FALSE) +
+  theme_void()
+
+#ggsave(filename = file.path(fig.dir, "4_paga/PAGA_clusters.png"), device = "png", width = 7, height = 4, dpi = 300)
+
+
+ggplot(clust_embedding, aes(x = X, y = Y)) +
+  geom_segment(data = clust_edges, aes(x = FromX, y = FromY, xend = ToX, yend = ToY, alpha = 0.5), size = (clust_edges$Connectivity)*10) +
+  geom_point(aes(fill = in_silico_clusters, size = Size), shape = 21, colour="white") +
+  scale_fill_manual(values = pal.cl) +
+  scale_size(range = c(6, 12), guide = FALSE) +
+  theme_void() + theme(legend.position = "none")  #+ scale_y_reverse() + coord_flip() 
+
+ggsave(filename = file.path(fig.dir, "4_paga/PAGA_clusters_nolegend.png"), device = "png", width = 5, height = 5, dpi = 300)
+
+```
+
+```{r}
+ggplot(cell_embedding, aes(x = X, y = Y)) +
+    geom_segment(data = cell_edges,
+                 aes(x = FromX, y = FromY, xend = ToX, yend = ToY,
+                     size = Connectivity, alpha = Connectivity), colour="grey50") +
+    geom_point(aes(colour = in_silico_clusters), size = 0.5) +
+    scale_colour_manual(values = pal.cl) +
+    scale_alpha_continuous(limits = c(0, 1), range = c(0.05, 0.5), guide = FALSE) +
+    scale_size(range = c(0.1, 0.5), guide = FALSE) +
+    theme_void()
+
+#ggsave(filename = file.path(fig.dir, "4_paga/PAGA_cells.png"), device = "png", width = 7, height = 4, dpi = 300)
+
+ggplot(cell_embedding, aes(x = X, y = Y)) +
+    geom_segment(data = cell_edges,
+                 aes(x = FromX, y = FromY, xend = ToX, yend = ToY,
+                     size = Connectivity, alpha = Connectivity), colour="grey50") +
+    geom_point(aes(colour = in_silico_clusters), size = 0.5) +
+    scale_colour_manual(values = pal.cl) +
+    scale_alpha_continuous(limits = c(0, 1), range = c(0.05, 0.5), guide = FALSE) +
+    scale_size(range = c(0.1, 0.5), guide = FALSE) +
+    theme_void() + theme(legend.position = "none")
+
+ggsave(filename = file.path(fig.dir, "4_paga/PAGA_cells_nolegend.png"), device = "png", width = 5, height = 5, dpi = 300)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--------------------------------------------------------------------------------
+## Session Information
+```{r}
+sessionInfo()
+```

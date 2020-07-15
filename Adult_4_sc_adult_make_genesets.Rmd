@@ -1,0 +1,365 @@
+---
+title: "Adult scRNAseq datasets analysis"
+subtitle: "Generate Gene Sets"
+author: "Renaud Mevel"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, cache.lazy = TRUE)
+```
+
+## Objective
+
+Generate gene sets 'specific' for:  
+
+* Each individual cluster identified previously  
+* Lum A/B/C vs Lum D  
+* Lum D vs A/B/C  
+* Lum E/F vs Lum A/B/C/D  
+* Lum A/B/C/D vs Basal  
+* Basal vs Lum A/B/C/D  
+  
+Directories need to be adapted throughout the scripts.
+  
+## Prepare the environment
+
+```{r , warning=FALSE, message=FALSE}
+# Data wrangling
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(data.table)
+
+# Plots
+library(gridExtra)
+library(ggpubr)
+
+# sc
+library(Seurat)
+library(sctransform)
+library(MAST)
+library(org.Mm.eg.db)
+library(DoubletFinder)
+
+# GO
+library(gprofiler2)
+
+# Palettes
+library(pals)
+pal25 <- as.character(pals::cols25(n=25))
+pal.trt <- c("#a1e186", "#b9006e")
+pal.rfp <- c("#ea4749", "#479bea")
+pal.runs <- c("#ec0016", "#ffc554", "#20a4ff")
+pal.lobe = c("#272873", "#45A5A7", "#cb5155")
+pal.pop <- 
+  c( 
+    "#7a0177", "#dd3497",    # cas AP
+    "#f768a1", "#fa9fb5",    # cas DLP
+    "#fc9272", "#cb181d",    # cas
+    "#CC6677", "#AA4466",    # cas VP
+    "#081d58", "#225ea8",    # hn AP
+    "#7fcdbb", "#7fb8cd",    # hn DLP
+    "#67a9cf", "#b2d3e7"     # hn VP
+    )
+pal.cl <- c(
+  "#00b6ed", "#b6ed00", "#3700ed", "#ed0040",
+  "#ff54d7", "#f998bf",
+  "#fc9101"
+  )
+
+# Directories
+setwd(dir = "~/set-directory/")
+pdf.dir <- "~/set-directory/"
+fig.dir <- "~/set-directory/"
+
+# Functions
+source("Adult_functions.R")
+
+# Seed
+set.seed(1)
+```
+
+## Load data
+
+```{r}
+sce <- readRDS(file.path("r_save/sce_integrated.rds"))
+```
+
+Check the data
+```{r}
+DimPlot(sce, pt.size=.5, cols=pal.cl)
+```
+
+## Individual clusters
+
+Load if exists already
+```{r, eval=FALSE}
+epi.markers <- readRDS(file.path("r_save/epi.markers.rds"))
+```
+
+*Cutoff used: logFC 0.25*
+
+Lum A
+```{r}
+LumA <- epi.markers %>% dplyr::filter(cluster == "Lum-A" & avg_logFC > 0) 
+write.table(LumA, file = paste0("r_export/custom_gene_sets/", "LumA_vs_all.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+Lum B
+```{r}
+LumB <- epi.markers %>% dplyr::filter(cluster == "Lum-B" & avg_logFC > 0) 
+write.table(LumB, file = paste0("r_export/custom_gene_sets/", "LumB_vs_all.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+Lum C
+```{r}
+LumC <- epi.markers %>% dplyr::filter(cluster == "Lum-C" & avg_logFC > 0) 
+write.table(LumC, file = paste0("r_export/custom_gene_sets/", "LumC_vs_all.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+Lum D
+```{r}
+LumD <- epi.markers %>% dplyr::filter(cluster == "Lum-D" & avg_logFC > 0) 
+write.table(LumD, file = paste0("r_export/custom_gene_sets/", "LumD_vs_all.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+Lum E 
+```{r}
+LumE <- epi.markers %>% dplyr::filter(cluster == "Lum-E" & avg_logFC > 0) 
+write.table(LumE, file = paste0("r_export/custom_gene_sets/", "LumE_vs_all.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+Lum F 
+```{r}
+LumF <- epi.markers %>% dplyr::filter(cluster == "Lum-F" & avg_logFC > 0) 
+write.table(LumF, file = paste0("r_export/custom_gene_sets/", "LumF_vs_all.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+Bas
+```{r}
+Bas <- epi.markers %>% dplyr::filter(cluster == "Bas" & avg_logFC > 0) 
+write.table(Bas, file = paste0("r_export/custom_gene_sets/", "Bas_vs_all.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+## Lum ABC vs Lum D
+
+```{r}
+LumABC_vs_LumD <- FindMarkers(
+  sce,
+  ident.1 =c ("Lum-A", "Lum-B", "Lum-C"),
+  ident.2 = c("Lum-D"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumABC_vs_LumD <- LumABC_vs_LumD %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumABC_vs_LumD, file = paste0("r_export/custom_gene_sets/", "LumABC_vs_LumD.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+## Lum D vs Lum ABC
+
+```{r}
+LumD_vs_LumABC <- FindMarkers(
+  sce,
+  ident.1 = c("Lum-D"), 
+  ident.2 =c ("Lum-A", "Lum-B", "Lum-C"),
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumD_vs_LumABC <- LumD_vs_LumABC %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumD_vs_LumABC, file = paste0("r_export/custom_gene_sets/", "LumD_vs_LumABC.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+## Lum EF vs Lum ABCD
+
+```{r}
+LumEF_vs_LumABCD <- FindMarkers(
+  sce,
+  ident.1 = c("Lum-E", "Lum-F"), 
+  ident.2 =c ("Lum-A", "Lum-B", "Lum-C", "Lum-D"),
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumEF_vs_LumABCD <- LumEF_vs_LumABCD %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumEF_vs_LumABCD, file = paste0("r_export/custom_gene_sets/", "LumEF_vs_LumABCD.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+## Lum EF vs Lum ABC
+
+```{r}
+LumEF_vs_LumABC <- FindMarkers(
+  sce,
+  ident.1 = c("Lum-E", "Lum-F"), 
+  ident.2 =c ("Lum-A", "Lum-B", "Lum-C"),
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumEF_vs_LumABC <- LumEF_vs_LumABC %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumEF_vs_LumABC, file = paste0("r_export/custom_gene_sets/", "LumEF_vs_LumABC.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+## Lum ABCD vs Basal
+
+```{r}
+LumABCD_vs_Bas <- FindMarkers(
+  sce,
+  ident.1 = c("Lum-A", "Lum-B", "Lum-C", "Lum-D"), 
+  ident.2 =c ("Bas"),
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumABCD_vs_Bas <- LumABCD_vs_Bas %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumABCD_vs_Bas, file = paste0("r_export/custom_gene_sets/", "LumABCD_vs_Bas.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+## Figure
+
+### Basal vs Lum ABCD
+
+```{r}
+Bas_vs_LumABCD <- FindMarkers(
+  sce,
+  ident.1 =c ("Bas"),
+  ident.2 = c("Lum-A", "Lum-B", "Lum-C", "Lum-D"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+Bas_vs_LumABCD <- Bas_vs_LumABCD %>% tibble::rownames_to_column(var = "gene")
+
+write.table(Bas_vs_LumABCD, file = paste0("r_export/custom_gene_sets/", "Bas_vs_LumABCD.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+### Lum D vs Lum ABC Basal
+
+```{r}
+LumD_vs_intact <- FindMarkers(
+  sce,
+  ident.1 =c ("Lum-D"),
+  ident.2 = c("Lum-A", "Lum-B", "Lum-C", "Bas"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumD_vs_intact <- LumD_vs_intact %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumD_vs_intact, file = paste0("r_export/custom_gene_sets/", "LumD_vs_intact.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+### Lum A vs Lum BCD Basal
+
+```{r}
+LumA_vs_intact <- FindMarkers(
+  sce,
+  ident.1 =c ("Lum-A"),
+  ident.2 = c("Lum-B", "Lum-C", "Lum-D", "Bas"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumA_vs_intact <- LumA_vs_intact %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumA_vs_intact, file = paste0("r_export/custom_gene_sets/", "LumA_vs_intact.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+### Lum B vs Lum ACD Basal
+
+```{r}
+LumB_vs_intact <- FindMarkers(
+  sce,
+  ident.1 =c ("Lum-B"),
+  ident.2 = c("Lum-A", "Lum-C", "Lum-D", "Bas"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumB_vs_intact <- LumB_vs_intact %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumB_vs_intact, file = paste0("r_export/custom_gene_sets/", "LumB_vs_intact.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+### Lum C vs Lum ABD Basal
+
+```{r}
+LumC_vs_intact <- FindMarkers(
+  sce,
+  ident.1 =c ("Lum-C"),
+  ident.2 = c("Lum-A", "Lum-B", "Lum-D", "Bas"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.25, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumC_vs_intact <- LumC_vs_intact %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumC_vs_intact, file = paste0("r_export/custom_gene_sets/", "LumC_vs_intact.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+### Lum EF vs Lum ABCD Basal
+
+```{r}
+LumEF_vs_all <- FindMarkers(
+  sce,
+  ident.1 =c ("Lum-E", "Lum-F"),
+  ident.2 = c("Lum-A", "Lum-B", "Lum-C","Lum-D", "Bas"), 
+  test.use = "MAST",
+  assay = "RNA",
+  min.pct = 0.1, 
+  logfc.threshold = 0.25,
+  only.pos = TRUE)
+
+LumEF_vs_all <- LumEF_vs_all %>% tibble::rownames_to_column(var = "gene")
+
+write.table(LumEF_vs_all, file = paste0("r_export/custom_gene_sets/", "LumEF_vs_all.txt"), sep="\t", quote=FALSE, row.names=FALSE, col.names=TRUE)
+```
+
+## Save image
+
+```{r, eval=FALSE}
+rm(sce)
+save.image("r_save/4_make_genesets.RData")
+```
+
+
+--------------------------------------------------------------------------------
+## Session Information
+```{r}
+sessionInfo()
+```
