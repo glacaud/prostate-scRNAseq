@@ -987,7 +987,6 @@ sci <- ScaleData(sci, verbose = T, assay = "RNA", features = rownames(sci))
 ### UMAP/PCA
 
 **Dim. red.**  
-Note: might have to optimise, especially regarding the Ly6d/Upk3a cluster...  
 ```{r}
 DefaultAssay(sci) <- "integrated"
 
